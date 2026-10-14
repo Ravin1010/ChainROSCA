@@ -1,0 +1,20 @@
+{
+  "name": "chainrosca",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SC6113 individual assignment \u2014 Iteration 0 development baseline",
+  "engines": {
+    "node": "^22.0.0 || ^24.0.0"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test"
+  },
+  "devDependencies": {
+    "hardhat": "2.29.1",
+    "@nomicfoundation/hardhat-ethers": "3.1.3",
+    "ethers": "6.17.0",
+    "solc": "0.8.28",
+    "dotenv": "16.6.1"
+  }
+}

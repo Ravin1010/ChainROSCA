@@ -1,0 +1,28 @@
+# Secrets (retain the blank example)
+.env
+.env.*
+!.env.example
+
+# Node and Hardhat output
+node_modules/
+artifacts/
+cache/
+coverage/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor, OS, and temporary files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+work/
