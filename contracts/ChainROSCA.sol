@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @notice Iteration 1: group membership and automatic Round 1 initialization only.
+/// @notice Group membership, automatic activation, and current-round contributions.
 contract ChainROSCA {
     enum GroupStatus { OPEN, ACTIVE, COMPLETED, CANCELLED }
     enum MemberStatus { REGISTERED, ACTIVE, OUTSTANDING, COMPLETED, CANCELLED }
@@ -44,6 +44,16 @@ contract ChainROSCA {
         RoundStatus status;
     }
 
+    struct ContributionRecord {
+        bool contributed;
+        bool late;
+        bool defaulted;
+        bool arrearsRepaid;
+        uint256 contributionTimestamp;
+        uint256 defaultTimestamp;
+        uint256 repaymentTimestamp;
+    }
+
     uint256 public groupCount;
     mapping(uint256 => Group) private groups;
     mapping(uint256 => mapping(address => Member)) private members;
@@ -51,6 +61,7 @@ contract ChainROSCA {
     mapping(uint256 => address[]) private applicants;
     mapping(uint256 => mapping(address => bool)) private alreadyListed;
     mapping(uint256 => mapping(uint8 => Round)) private rounds;
+    mapping(uint256 => mapping(uint8 => mapping(address => ContributionRecord))) private contributionRecords;
 
     event GroupCreated(uint256 indexed groupId, address indexed creator, string name, uint8 targetMembers);
     event JoinRequested(uint256 indexed groupId, address indexed applicant);
@@ -59,6 +70,8 @@ contract ChainROSCA {
     event MemberJoined(uint256 indexed groupId, address indexed member, uint8 payoutRound);
     event GroupStarted(uint256 indexed groupId);
     event GroupCancelled(uint256 indexed groupId);
+    event ContributionMade(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
+    event LateContributionMade(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
 
     modifier groupExists(uint256 groupId) {
         require(groups[groupId].id != 0, "Group does not exist");
@@ -162,6 +175,39 @@ contract ChainROSCA {
         emit GroupCancelled(groupId);
     }
 
+    function contribute(uint256 groupId) external payable groupExists(groupId) {
+        Group storage group = groups[groupId];
+        require(group.status == GroupStatus.ACTIVE, "Group is not active");
+        Member storage member = members[groupId][msg.sender];
+        require(member.exists, "Not a member");
+        require(
+            member.status == MemberStatus.ACTIVE || member.status == MemberStatus.OUTSTANDING,
+            "Member cannot contribute"
+        );
+        uint8 roundNumber = group.currentRound;
+        require(roundNumber > 0, "Round has not started");
+        Round storage round = rounds[groupId][roundNumber];
+        require(round.status == RoundStatus.COLLECTING, "Round is not collecting");
+        ContributionRecord storage record = contributionRecords[groupId][roundNumber][msg.sender];
+        require(!record.contributed, "Already contributed");
+        require(msg.value == group.contributionAmount, "Incorrect contribution amount");
+        require(block.timestamp <= round.graceDeadline, "Grace deadline has passed");
+
+        bool late = block.timestamp > round.contributionDeadline;
+        record.contributed = true;
+        record.late = late;
+        record.contributionTimestamp = block.timestamp;
+        round.initiallyCollected += msg.value;
+        round.contributionCount += 1;
+        member.totalContributed += msg.value;
+
+        if (late) {
+            emit LateContributionMade(groupId, roundNumber, msg.sender, msg.value);
+        } else {
+            emit ContributionMade(groupId, roundNumber, msg.sender, msg.value);
+        }
+    }
+
     function _activateGroup(uint256 groupId) internal {
         Group storage group = groups[groupId];
         group.status = GroupStatus.ACTIVE;
@@ -222,5 +268,11 @@ contract ChainROSCA {
         external view groupExists(groupId) returns (Round memory)
     {
         return rounds[groupId][roundNumber];
+    }
+
+    function getContributionRecord(uint256 groupId, uint8 roundNumber, address member)
+        external view groupExists(groupId) returns (ContributionRecord memory)
+    {
+        return contributionRecords[groupId][roundNumber][member];
     }
 }

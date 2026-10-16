@@ -4,13 +4,17 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 1 — group and membership smart contract.**
+**Current status: Iteration 2 — contributions and round timing.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
 group and initializes Round 1 timing metadata; there is no `startGroup()` function.
-Contributions, settlement, defaults, arrears, payouts, and withdrawals are not
-implemented. Flask, MongoDB, frontend integration, and deployment remain future work.
+ACTIVE members, including the scheduled recipient, can contribute the exact fixed
+ETH amount once in the current round. Payments through the normal deadline are
+on-time; payments after it through the grace deadline are late but accepted.
+Contribution records and member/round accounting are updated, and ETH stays in the
+contract. Settlement, defaults, arrears, payouts, withdrawals, and round progression
+remain future work, as do Flask, MongoDB, frontend integration, and deployment.
 
 ## Technology stack
 
@@ -31,7 +35,8 @@ npm test
 
 Hardhat uses the pinned `solc` npm package for compilation; no separate compiler
 download is required. `test/ChainROSCA.test.js` verifies the Iteration 1 lifecycle,
-validation, authorization, activation metadata, cancellation, and ABI scope.
+validation, authorization, activation metadata, cancellation, and Iteration 2
+contributions, timing boundaries, accounting, custody, and ABI scope.
 No deployment scripts or Sepolia network are configured in this iteration.
 
 ## Python / Flask setup

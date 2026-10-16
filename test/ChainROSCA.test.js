@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { ethers, artifacts } = require("hardhat");
+const { ethers, artifacts, network } = require("hardhat");
 
 const GROUP = { OPEN: 0n, ACTIVE: 1n, CANCELLED: 3n };
 const MEMBER = { REGISTERED: 0n, ACTIVE: 1n, CANCELLED: 4n };
@@ -8,7 +8,7 @@ const AMOUNT = ethers.parseEther("0.01");
 const DURATION = 3600n;
 const GRACE = 600n;
 
-describe("ChainROSCA — Iteration 1", function () {
+describe("ChainROSCA — Iterations 1 and 2", function () {
   let contract, creator, alice, bob, carol, dave, outsider;
 
   beforeEach(async function () {
@@ -391,6 +391,254 @@ describe("ChainROSCA — Iteration 1", function () {
     });
   });
 
+  describe("Iteration 2 contributions and round timing", function () {
+    beforeEach(async function () { await create(); });
+
+    async function pay(wallet = alice, value = AMOUNT, groupId = 1) {
+      return (await contract.connect(wallet).contribute(groupId, { value })).wait();
+    }
+
+    async function at(timestamp) {
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(timestamp)]);
+    }
+
+    function untouched(record) {
+      assert.deepEqual(Array.from(record), [false, false, false, false, 0n, 0n, 0n]);
+    }
+
+    async function assertPayment(receipt, wallet, late, groupId = 1, amount = AMOUNT) {
+      const block = await ethers.provider.getBlock(receipt.blockNumber);
+      const record = await contract.getContributionRecord(groupId, 1, wallet.address);
+      assert.deepEqual(Array.from(record), [true, late, false, false, BigInt(block.timestamp), 0n, 0n]);
+      const name = late ? "LateContributionMade" : "ContributionMade";
+      // Exactly one log also excludes the opposite timing event and any later-iteration event.
+      assert.equal(receipt.logs.length, 1);
+      const args = event(receipt, name);
+      assert.equal(args.groupId, BigInt(groupId));
+      assert.equal(args.roundNumber, 1n);
+      assert.equal(args.member, wallet.address);
+      assert.equal(args.amount, amount);
+      const definition = contract.interface.getEvent(name);
+      assert.deepEqual(definition.inputs.map((input) => input.indexed), [true, true, true, false]);
+    }
+
+    async function snapshot(wallet = alice, groupId = 1) {
+      return {
+        record: Array.from(await contract.getContributionRecord(groupId, 1, wallet.address)),
+        round: Array.from(await contract.getRoundDetails(groupId, 1)),
+        member: Array.from(await contract.getMemberDetails(groupId, wallet.address)),
+        group: Array.from(await contract.getGroupDetails(groupId)),
+        balance: await ethers.provider.getBalance(await contract.getAddress()),
+      };
+    }
+
+    async function unchangedFailure(action, message, wallet = alice) {
+      const before = await snapshot(wallet);
+      await reverts(action(), message);
+      assert.deepEqual(await snapshot(wallet), before);
+    }
+
+    it("returns a zero/default record for untouched members and future rounds", async function () {
+      untouched(await contract.getContributionRecord(1, 1, creator.address));
+      await activate();
+      for (const wallet of [creator, alice, outsider]) {
+        untouched(await contract.getContributionRecord(1, 1, wallet.address));
+        untouched(await contract.getContributionRecord(1, 2, wallet.address));
+      }
+    });
+
+    it("accepts an active member's exact payment and records every field and accounting value", async function () {
+      await activate();
+      const recipientBefore = await ethers.provider.getBalance(creator.address);
+      const receipt = await pay();
+      await assertPayment(receipt, alice, false);
+      const round = await contract.getRoundDetails(1, 1);
+      assert.equal(round.initiallyCollected, AMOUNT);
+      assert.equal(round.contributionCount, 1n);
+      assert.equal(round.recoveredArrears, 0n);
+      assert.equal(round.expectedAmount, 3n * AMOUNT);
+      const member = await contract.getMemberDetails(1, alice.address);
+      assert.equal(member.totalContributed, AMOUNT);
+      assert.equal(member.status, MEMBER.ACTIVE);
+      assert.equal(member.defaultCount, 0n);
+      assert.equal(member.totalArrearsRepaid, 0n);
+      assert.equal(member.outstandingArrears, 0n);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), AMOUNT);
+      assert.equal(await ethers.provider.getBalance(creator.address), recipientBefore);
+    });
+
+    it("rejects a non-member even when they have a pending join request", async function () {
+      await request(carol);
+      await activate();
+      for (const wallet of [outsider, carol]) {
+        await unchangedFailure(() => contract.connect(wallet).contribute(1, { value: AMOUNT }), "Not a member", wallet);
+      }
+    });
+
+    it("rejects a registered creator's payment while OPEN with no initialized current round", async function () {
+      assert.equal((await contract.getGroupDetails(1)).currentRound, 0n);
+      assert.equal((await contract.getRoundDetails(1, 1)).status, 0n);
+      await unchangedFailure(() => contract.contribute(1, { value: AMOUNT }), "Group is not active", creator);
+    });
+
+    it("rejects a cancelled member's payment", async function () {
+      await contract.cancelGroup(1);
+      await unchangedFailure(() => contract.contribute(1, { value: AMOUNT }), "Group is not active", creator);
+    });
+
+    it("rejects contributions and record reads for nonexistent groups", async function () {
+      for (const id of [0, 2]) {
+        await reverts(contract.connect(alice).contribute(id, { value: AMOUNT }), "Group does not exist");
+        await reverts(contract.getContributionRecord(id, 1, alice.address), "Group does not exist");
+      }
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), 0n);
+    });
+
+    for (const [label, value] of [["underpayment", AMOUNT - 1n], ["overpayment", AMOUNT + 1n], ["zero ETH", 0n]]) {
+      it(`rejects ${label} without changing records, accounting, or balance`, async function () {
+        await activate();
+        await unchangedFailure(() => contract.connect(alice).contribute(1, { value }), "Incorrect contribution amount");
+        await assertPayment(await pay(), alice, false);
+      });
+    }
+
+    for (const recipient of [false, true]) {
+      it(`rejects duplicate contributions from ${recipient ? "the scheduled recipient" : "another member"} without state changes`, async function () {
+        await activate();
+        const wallet = recipient ? creator : alice;
+        await assertPayment(await pay(wallet), wallet, false);
+        await unchangedFailure(() => contract.connect(wallet).contribute(1, { value: AMOUNT }), "Already contributed", wallet);
+      });
+    }
+
+    it("requires the recipient to follow the exact payment rule and accounts for their payment normally", async function () {
+      await activate();
+      assert.equal((await contract.getRoundDetails(1, 1)).recipient, creator.address);
+      untouched(await contract.getContributionRecord(1, 1, creator.address));
+      await unchangedFailure(() => contract.contribute(1, { value: 0n }), "Incorrect contribution amount", creator);
+      await assertPayment(await pay(creator), creator, false);
+      assert.equal((await contract.getMemberDetails(1, creator.address)).totalContributed, AMOUNT);
+      assert.equal((await contract.getRoundDetails(1, 1)).contributionCount, 1n);
+      assert.equal((await contract.getRoundDetails(1, 1)).initiallyCollected, AMOUNT);
+    });
+
+    for (const target of [3, 5]) {
+      it(`accumulates all ${target} members' payments without settlement, defaults, payouts, or progression`, async function () {
+        // Use a separate group to exercise both membership capacities with the same contribution flow.
+        await contract.createGroup("Full contributions", target, AMOUNT, DURATION, GRACE);
+        const wallets = [creator, alice, bob, carol, dave].slice(0, target);
+        for (const wallet of wallets.slice(1)) {
+          await contract.connect(wallet).requestJoin(2);
+          await contract.approveJoinRequest(2, wallet.address);
+        }
+        const before = await contract.getRoundDetails(2, 1);
+        let recipientBalance;
+        for (const [index, wallet] of wallets.entries()) {
+          if (index === target - 1) await at(before.contributionDeadline + 1n);
+          await assertPayment(await pay(wallet, AMOUNT, 2), wallet, index === target - 1, 2);
+          const round = await contract.getRoundDetails(2, 1);
+          assert.equal(round.contributionCount, BigInt(index + 1));
+          assert.equal(round.initiallyCollected, BigInt(index + 1) * AMOUNT);
+          assert.equal(await ethers.provider.getBalance(await contract.getAddress()), BigInt(index + 1) * AMOUNT);
+          if (index === 0) recipientBalance = await ethers.provider.getBalance(creator.address);
+          else assert.equal(await ethers.provider.getBalance(creator.address), recipientBalance);
+        }
+        const round = await contract.getRoundDetails(2, 1);
+        assert.equal(round.status, 1n); // Still COLLECTING, even with all payments.
+        assert.equal(round.recoveredArrears, 0n);
+        for (const field of ["number", "recipient", "startTime", "contributionDeadline", "graceDeadline", "expectedAmount"]) {
+          assert.equal(round[field], before[field]);
+        }
+        const group = await contract.getGroupDetails(2);
+        assert.equal(group.currentRound, 1n);
+        assert.equal(group.status, GROUP.ACTIVE);
+        assert.equal((await contract.getRoundDetails(2, 2)).number, 0n);
+        assert.equal((await contract.getRoundDetails(2, 2)).status, 0n);
+        for (const wallet of wallets) {
+          const member = await contract.getMemberDetails(2, wallet.address);
+          assert.equal(member.status, MEMBER.ACTIVE);
+          assert.equal(member.totalContributed, AMOUNT);
+          assert.equal(member.totalArrearsRepaid, 0n);
+          assert.equal(member.outstandingArrears, 0n);
+          assert.equal(member.defaultCount, 0n);
+          untouched(await contract.getContributionRecord(2, 2, wallet.address));
+        }
+      });
+    }
+
+    const boundaries = [
+      ["one second before normal deadline", "contributionDeadline", -1n, false],
+      ["exactly at normal deadline", "contributionDeadline", 0n, false],
+      ["one second after normal deadline", "contributionDeadline", 1n, true],
+      ["exactly at grace deadline", "graceDeadline", 0n, true],
+    ];
+    for (const [label, field, offset, late] of boundaries) {
+      it(`accepts payment ${label} as ${late ? "late" : "on-time"} with exactly the correct event`, async function () {
+        await activate();
+        const before = await contract.getRoundDetails(1, 1);
+        const timestamp = before[field] + offset;
+        await at(timestamp);
+        await assertPayment(await pay(), alice, late);
+        assert.equal((await contract.getContributionRecord(1, 1, alice.address)).contributionTimestamp, timestamp);
+        const after = await contract.getRoundDetails(1, 1);
+        assert.equal(after.initiallyCollected, AMOUNT);
+        assert.equal(after.contributionCount, 1n);
+        assert.equal(after.recoveredArrears, 0n);
+        assert.equal(after.status, 1n);
+        assert.equal((await contract.getMemberDetails(1, alice.address)).totalContributed, AMOUNT);
+        assert.equal(await ethers.provider.getBalance(await contract.getAddress()), AMOUNT);
+      });
+    }
+
+    it("rejects payment one second after grace without altering records, accounting, or recording defaults", async function () {
+      await activate();
+      await pay(bob); // Preserve an existing valid payment while another member misses the deadline.
+      const round = await contract.getRoundDetails(1, 1);
+      await at(round.graceDeadline + 1n);
+      await unchangedFailure(
+        () => contract.connect(alice).contribute(1, { value: AMOUNT, gasLimit: 500000 }),
+        "Grace deadline has passed"
+      );
+      untouched(await contract.getContributionRecord(1, 1, alice.address));
+      const member = await contract.getMemberDetails(1, alice.address);
+      assert.equal(member.status, MEMBER.ACTIVE);
+      zeroFinances(member);
+      assert.equal((await contract.getRoundDetails(1, 1)).status, 1n);
+      assert.equal((await contract.getGroupDetails(1)).currentRound, 1n);
+      assert.equal((await contract.getRoundDetails(1, 2)).number, 0n);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), AMOUNT);
+    });
+
+    it("rejects direct ETH transfers and unknown calls while retaining valid contributions", async function () {
+      await activate();
+      await pay();
+      const before = await snapshot();
+      await assert.rejects(bob.sendTransaction({ to: await contract.getAddress(), value: AMOUNT }));
+      await assert.rejects(bob.sendTransaction({ to: await contract.getAddress(), value: AMOUNT, data: "0x12345678" }));
+      assert.deepEqual(await snapshot(), before);
+    });
+
+    it("isolates contribution records and accounting between groups", async function () {
+      await activate();
+      await contract.createGroup("Second circle", 3, 2n * AMOUNT, DURATION, GRACE);
+      for (const wallet of [alice, bob]) {
+        await contract.connect(wallet).requestJoin(2);
+        await contract.approveJoinRequest(2, wallet.address);
+      }
+      await pay();
+      untouched(await contract.getContributionRecord(2, 1, alice.address));
+      assert.equal((await contract.getMemberDetails(2, alice.address)).totalContributed, 0n);
+      assert.equal((await contract.getRoundDetails(2, 1)).initiallyCollected, 0n);
+      const first = await snapshot();
+      await assertPayment(await pay(alice, 2n * AMOUNT, 2), alice, false, 2, 2n * AMOUNT);
+      assert.equal((await contract.getMemberDetails(2, alice.address)).totalContributed, 2n * AMOUNT);
+      assert.equal((await contract.getRoundDetails(2, 1)).initiallyCollected, 2n * AMOUNT);
+      const after = await snapshot();
+      assert.deepEqual({ ...after, balance: first.balance }, first);
+      assert.equal(after.balance, 3n * AMOUNT);
+    });
+  });
+
   describe("existence checks and ABI scope", function () {
     const calls = [
       ["requestJoin", []], ["approveJoinRequest", [ethers.ZeroAddress]],
@@ -408,19 +656,24 @@ describe("ChainROSCA — Iteration 1", function () {
       });
     }
 
-    it("exposes exactly the Iteration 1 functions and events, with no payable entry points", async function () {
+    it("exposes exactly the Iteration 2 interface with contribute as the only payable entry point", async function () {
       const { abi } = await artifacts.readArtifact("ChainROSCA");
       const functions = abi.filter((item) => item.type === "function");
       assert.deepEqual(functions.map((item) => item.name).sort(), [
         "groupCount", "createGroup", "requestJoin", "approveJoinRequest", "rejectJoinRequest", "cancelGroup",
         "getGroupDetails", "getMembers", "getMemberDetails", "getJoinRequests", "getJoinRequestStatus", "getRoundDetails",
+        "contribute", "getContributionRecord",
       ].sort());
-      for (const name of ["startGroup", "contribute", "settleRound", "repayArrears", "withdrawPayout"]) {
+      for (const name of ["startGroup", "settleRound", "repayArrears", "withdrawPayout"]) {
         assert.equal(functions.some((item) => item.name === name), false, `${name} must be absent`);
       }
-      assert.equal(abi.some((item) => item.stateMutability === "payable" || item.type === "receive" || item.type === "fallback"), false);
+      assert.deepEqual(functions.filter((item) => item.stateMutability === "payable").map((item) => item.name), ["contribute"]);
+      assert.equal(abi.some((item) => item.type === "receive" || item.type === "fallback"), false);
+      assert.deepEqual(functions.find((item) => item.name === "contribute").inputs.map((item) => item.type), ["uint256"]);
+      assert.deepEqual(functions.find((item) => item.name === "getContributionRecord").inputs.map((item) => item.type), ["uint256", "uint8", "address"]);
       assert.deepEqual(abi.filter((item) => item.type === "event").map((item) => item.name).sort(), [
         "GroupCreated", "JoinRequested", "JoinApproved", "JoinRejected", "MemberJoined", "GroupStarted", "GroupCancelled",
+        "ContributionMade", "LateContributionMade",
       ].sort());
     });
   });
