@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @notice Group membership, automatic activation, and current-round contributions.
+/// @notice ROSCA membership, contributions, settlement, and default accounting.
 contract ChainROSCA {
     enum GroupStatus { OPEN, ACTIVE, COMPLETED, CANCELLED }
     enum MemberStatus { REGISTERED, ACTIVE, OUTSTANDING, COMPLETED, CANCELLED }
@@ -40,6 +40,7 @@ contract ChainROSCA {
         uint256 expectedAmount;
         uint256 initiallyCollected;
         uint256 recoveredArrears;
+        uint256 outstandingShortfall;
         uint8 contributionCount;
         RoundStatus status;
     }
@@ -62,6 +63,7 @@ contract ChainROSCA {
     mapping(uint256 => mapping(address => bool)) private alreadyListed;
     mapping(uint256 => mapping(uint8 => Round)) private rounds;
     mapping(uint256 => mapping(uint8 => mapping(address => ContributionRecord))) private contributionRecords;
+    mapping(address => uint256) private withdrawableBalances;
 
     event GroupCreated(uint256 indexed groupId, address indexed creator, string name, uint8 targetMembers);
     event JoinRequested(uint256 indexed groupId, address indexed applicant);
@@ -72,6 +74,9 @@ contract ChainROSCA {
     event GroupCancelled(uint256 indexed groupId);
     event ContributionMade(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
     event LateContributionMade(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
+    event MemberDefaulted(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
+    event RoundSettled(uint256 indexed groupId, uint8 indexed roundNumber, address indexed recipient, uint256 initiallyCollected, uint256 outstandingShortfall);
+    event PayoutAllocated(uint256 indexed groupId, uint8 indexed roundNumber, address indexed recipient, uint256 amount);
 
     modifier groupExists(uint256 groupId) {
         require(groups[groupId].id != 0, "Group does not exist");
@@ -208,22 +213,65 @@ contract ChainROSCA {
         }
     }
 
+    function settleRound(uint256 groupId) external groupExists(groupId) {
+        Group storage group = groups[groupId];
+        require(group.status == GroupStatus.ACTIVE, "Group is not active");
+        uint8 roundNumber = group.currentRound;
+        require(roundNumber > 0, "Round has not started");
+        Round storage round = rounds[groupId][roundNumber];
+        require(round.status == RoundStatus.COLLECTING, "Round is not collecting");
+        bool fullyFunded = round.contributionCount == group.targetMembers;
+        require(fullyFunded || block.timestamp > round.graceDeadline, "Settlement is not ready");
+
+        if (!fullyFunded) {
+            for (uint256 i = 0; i < group.members.length; i++) {
+                address wallet = group.members[i];
+                ContributionRecord storage record = contributionRecords[groupId][roundNumber][wallet];
+                if (!record.contributed) {
+                    record.defaulted = true;
+                    record.defaultTimestamp = block.timestamp;
+                    Member storage member = members[groupId][wallet];
+                    member.defaultCount += 1;
+                    member.outstandingArrears += group.contributionAmount;
+                    member.status = MemberStatus.OUTSTANDING;
+                    emit MemberDefaulted(groupId, roundNumber, wallet, group.contributionAmount);
+                }
+            }
+        }
+
+        round.outstandingShortfall = round.expectedAmount - round.initiallyCollected;
+        round.status = RoundStatus.SETTLED;
+        withdrawableBalances[round.recipient] += round.initiallyCollected;
+        emit RoundSettled(groupId, roundNumber, round.recipient, round.initiallyCollected, round.outstandingShortfall);
+        emit PayoutAllocated(groupId, roundNumber, round.recipient, round.initiallyCollected);
+
+        if (roundNumber < group.targetMembers) {
+            _initializeRound(groupId, roundNumber + 1);
+        }
+    }
+
     function _activateGroup(uint256 groupId) internal {
         Group storage group = groups[groupId];
         group.status = GroupStatus.ACTIVE;
-        group.currentRound = 1;
         for (uint256 i = 0; i < group.members.length; i++) {
             members[groupId][group.members[i]].status = MemberStatus.ACTIVE;
         }
-        Round storage round = rounds[groupId][1];
-        round.number = 1;
-        round.recipient = group.members[0];
+        _initializeRound(groupId, 1);
+        emit GroupStarted(groupId);
+    }
+
+    /// @dev Called only for a fresh round in the fixed payout rotation.
+    function _initializeRound(uint256 groupId, uint8 roundNumber) internal {
+        Group storage group = groups[groupId];
+        group.currentRound = roundNumber;
+        Round storage round = rounds[groupId][roundNumber];
+        round.number = roundNumber;
+        round.recipient = group.members[roundNumber - 1];
         round.startTime = block.timestamp;
         round.contributionDeadline = block.timestamp + group.roundDuration;
         round.graceDeadline = round.contributionDeadline + group.gracePeriod;
         round.expectedAmount = uint256(group.targetMembers) * group.contributionAmount;
         round.status = RoundStatus.COLLECTING;
-        emit GroupStarted(groupId);
     }
 
     function getGroupDetails(uint256 groupId) external view groupExists(groupId) returns (
@@ -274,5 +322,9 @@ contract ChainROSCA {
         external view groupExists(groupId) returns (ContributionRecord memory)
     {
         return contributionRecords[groupId][roundNumber][member];
+    }
+
+    function getWithdrawableBalance(address wallet) external view returns (uint256) {
+        return withdrawableBalances[wallet];
     }
 }

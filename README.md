@@ -4,7 +4,7 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 2 — contributions and round timing.**
+**Current status: Iteration 3 — settlement and defaults.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
@@ -13,8 +13,13 @@ ACTIVE members, including the scheduled recipient, can contribute the exact fixe
 ETH amount once in the current round. Payments through the normal deadline are
 on-time; payments after it through the grace deadline are late but accepted.
 Contribution records and member/round accounting are updated, and ETH stays in the
-contract. Settlement, defaults, arrears, payouts, withdrawals, and round progression
-remain future work, as do Flask, MongoDB, frontend integration, and deployment.
+contract. Anyone can settle a fully funded round immediately, or an underfunded
+round strictly after grace expires. Missing contributions become permanent
+historical defaults, with member arrears and round shortfall recorded. Settlement
+allocates the actual collected ETH to the recipient and automatically advances
+through the fixed payout order. No ETH is transferred; withdrawals, arrears
+repayment, and group completion remain future work, as do Flask, MongoDB,
+frontend integration, and deployment.
 
 ## Technology stack
 
@@ -36,7 +41,8 @@ npm test
 Hardhat uses the pinned `solc` npm package for compilation; no separate compiler
 download is required. `test/ChainROSCA.test.js` verifies the Iteration 1 lifecycle,
 validation, authorization, activation metadata, cancellation, and Iteration 2
-contributions, timing boundaries, accounting, custody, and ABI scope.
+contributions, timing boundaries, accounting, custody, and Iteration 3 settlement,
+defaults, payout allocations, round progression, and ABI scope.
 No deployment scripts or Sepolia network are configured in this iteration.
 
 ## Python / Flask setup
