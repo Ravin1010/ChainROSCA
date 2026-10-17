@@ -4,7 +4,7 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 3 — settlement and defaults.**
+**Current status: Iteration 4 — arrears repayment, payout withdrawal, and completion.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
@@ -17,9 +17,14 @@ contract. Anyone can settle a fully funded round immediately, or an underfunded
 round strictly after grace expires. Missing contributions become permanent
 historical defaults, with member arrears and round shortfall recorded. Settlement
 allocates the actual collected ETH to the recipient and automatically advances
-through the fixed payout order. No ETH is transferred; withdrawals, arrears
-repayment, and group completion remain future work, as do Flask, MongoDB,
-frontend integration, and deployment.
+through the fixed payout order. Members can repay exact historical arrears,
+updating the original round's recovery/shortfall accounting and crediting its
+original recipient while preserving default history. Global payouts can be
+withdrawn in full with checks/effects/interactions and a local reentrancy guard.
+Completion is automatic once the final round settles and all arrears are cleared;
+unwithdrawn payouts do not block it. The core Solidity lifecycle is implemented.
+Further testing/security hardening, Flask, MongoDB, frontend integration, and
+deployment remain later work.
 
 ## Technology stack
 
@@ -42,7 +47,9 @@ Hardhat uses the pinned `solc` npm package for compilation; no separate compiler
 download is required. `test/ChainROSCA.test.js` verifies the Iteration 1 lifecycle,
 validation, authorization, activation metadata, cancellation, and Iteration 2
 contributions, timing boundaries, accounting, custody, and Iteration 3 settlement,
-defaults, payout allocations, round progression, and ABI scope.
+defaults, payout allocations, round progression, and Iteration 4 repayment,
+withdrawal safety, completion, and ABI scope. `contracts/test/WithdrawalReceiver.sol`
+is a test-only receiver for failed transfers and reentrancy checks.
 No deployment scripts or Sepolia network are configured in this iteration.
 
 ## Python / Flask setup

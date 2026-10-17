@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @notice ROSCA membership, contributions, settlement, and default accounting.
+/// @notice ROSCA membership, contributions, settlement, arrears, and payouts.
 contract ChainROSCA {
     enum GroupStatus { OPEN, ACTIVE, COMPLETED, CANCELLED }
     enum MemberStatus { REGISTERED, ACTIVE, OUTSTANDING, COMPLETED, CANCELLED }
@@ -64,6 +64,7 @@ contract ChainROSCA {
     mapping(uint256 => mapping(uint8 => Round)) private rounds;
     mapping(uint256 => mapping(uint8 => mapping(address => ContributionRecord))) private contributionRecords;
     mapping(address => uint256) private withdrawableBalances;
+    bool private withdrawing;
 
     event GroupCreated(uint256 indexed groupId, address indexed creator, string name, uint8 targetMembers);
     event JoinRequested(uint256 indexed groupId, address indexed applicant);
@@ -77,6 +78,17 @@ contract ChainROSCA {
     event MemberDefaulted(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, uint256 amount);
     event RoundSettled(uint256 indexed groupId, uint8 indexed roundNumber, address indexed recipient, uint256 initiallyCollected, uint256 outstandingShortfall);
     event PayoutAllocated(uint256 indexed groupId, uint8 indexed roundNumber, address indexed recipient, uint256 amount);
+    event ArrearsRepaid(uint256 indexed groupId, uint8 indexed roundNumber, address indexed member, address recipient, uint256 amount);
+    event PayoutWithdrawn(address indexed recipient, uint256 amount);
+    event MemberCompleted(uint256 indexed groupId, address indexed member);
+    event GroupCompleted(uint256 indexed groupId);
+
+    modifier nonReentrant() {
+        require(!withdrawing, "Withdrawal reentrancy");
+        withdrawing = true;
+        _;
+        withdrawing = false;
+    }
 
     modifier groupExists(uint256 groupId) {
         require(groups[groupId].id != 0, "Group does not exist");
@@ -247,6 +259,69 @@ contract ChainROSCA {
 
         if (roundNumber < group.targetMembers) {
             _initializeRound(groupId, roundNumber + 1);
+        } else {
+            _updateCompletion(groupId);
+        }
+    }
+
+    function repayArrears(uint256 groupId, uint8 roundNumber) external payable groupExists(groupId) {
+        Group storage group = groups[groupId];
+        Member storage member = members[groupId][msg.sender];
+        require(member.exists, "Not a member");
+        require(
+            group.status == GroupStatus.ACTIVE || group.status == GroupStatus.COMPLETED,
+            "Group cannot resolve arrears"
+        );
+        require(roundNumber > 0 && roundNumber <= group.targetMembers, "Invalid round number");
+        Round storage round = rounds[groupId][roundNumber];
+        require(round.status == RoundStatus.SETTLED, "Round is not settled");
+        ContributionRecord storage record = contributionRecords[groupId][roundNumber][msg.sender];
+        require(record.defaulted, "No default to repay");
+        require(!record.arrearsRepaid, "Arrears already repaid");
+        require(msg.value == group.contributionAmount, "Incorrect repayment amount");
+
+        record.arrearsRepaid = true;
+        record.repaymentTimestamp = block.timestamp;
+        member.totalArrearsRepaid += msg.value;
+        member.outstandingArrears -= msg.value;
+        round.recoveredArrears += msg.value;
+        round.outstandingShortfall -= msg.value;
+        withdrawableBalances[round.recipient] += msg.value;
+        member.status = member.outstandingArrears == 0 ? MemberStatus.ACTIVE : MemberStatus.OUTSTANDING;
+        emit ArrearsRepaid(groupId, roundNumber, msg.sender, round.recipient, msg.value);
+        _updateCompletion(groupId);
+    }
+
+    function withdrawPayout() external nonReentrant {
+        uint256 amount = withdrawableBalances[msg.sender];
+        require(amount > 0, "No payout to withdraw");
+        withdrawableBalances[msg.sender] = 0;
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Payout transfer failed");
+        emit PayoutWithdrawn(msg.sender, amount);
+    }
+
+    function _updateCompletion(uint256 groupId) internal {
+        Group storage group = groups[groupId];
+        if (group.currentRound != group.targetMembers
+            || rounds[groupId][group.targetMembers].status != RoundStatus.SETTLED) {
+            return;
+        }
+        bool allClear = true;
+        for (uint256 i = 0; i < group.members.length; i++) {
+            address wallet = group.members[i];
+            Member storage member = members[groupId][wallet];
+            if (member.outstandingArrears > 0) {
+                member.status = MemberStatus.OUTSTANDING;
+                allClear = false;
+            } else if (member.status != MemberStatus.COMPLETED) {
+                member.status = MemberStatus.COMPLETED;
+                emit MemberCompleted(groupId, wallet);
+            }
+        }
+        if (allClear && group.status != GroupStatus.COMPLETED) {
+            group.status = GroupStatus.COMPLETED;
+            emit GroupCompleted(groupId);
         }
     }
 

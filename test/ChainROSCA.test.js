@@ -1,14 +1,14 @@
 const assert = require("node:assert/strict");
 const { ethers, artifacts, network } = require("hardhat");
 
-const GROUP = { OPEN: 0n, ACTIVE: 1n, CANCELLED: 3n };
-const MEMBER = { REGISTERED: 0n, ACTIVE: 1n, OUTSTANDING: 2n, CANCELLED: 4n };
+const GROUP = { OPEN: 0n, ACTIVE: 1n, COMPLETED: 2n, CANCELLED: 3n };
+const MEMBER = { REGISTERED: 0n, ACTIVE: 1n, OUTSTANDING: 2n, COMPLETED: 3n, CANCELLED: 4n };
 const REQUEST = { NONE: 0n, PENDING: 1n, APPROVED: 2n, REJECTED: 3n };
 const AMOUNT = ethers.parseEther("0.01");
 const DURATION = 3600n;
 const GRACE = 600n;
 
-describe("ChainROSCA — Iterations 1 to 3", function () {
+describe("ChainROSCA — Iterations 1 to 4", function () {
   let contract, creator, alice, bob, carol, dave, outsider;
 
   beforeEach(async function () {
@@ -710,8 +710,13 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
         assert.equal(round[field], before[field], field);
       }
       const logs = receipt.logs.map((log) => contract.interface.parseLog(log));
+      const final = number === group.targetMembers;
+      const completed = final ? ordered.filter((wallet, index) =>
+        !missing.includes(wallet.address) && members[index].outstandingArrears === 0n) : [];
+      const groupComplete = final && completed.length === ordered.length;
       assert.deepEqual(logs.map((log) => log.name), [
         ...missing.map(() => "MemberDefaulted"), "RoundSettled", "PayoutAllocated",
+        ...completed.map(() => "MemberCompleted"), ...(groupComplete ? ["GroupCompleted"] : []),
       ]);
       const missingInOrder = ordered.filter((wallet) => missing.includes(wallet.address));
       for (const [index, wallet] of missingInOrder.entries()) {
@@ -744,7 +749,7 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
           assert.deepEqual(Array.from(record), Array.from(records[index]));
           assert.equal(member.defaultCount, members[index].defaultCount);
           assert.equal(member.outstandingArrears, members[index].outstandingArrears);
-          assert.equal(member.status, members[index].status);
+          assert.equal(member.status, completed.includes(wallet) ? MEMBER.COMPLETED : members[index].status);
         }
         assert.equal(member.totalContributed, members[index].totalContributed);
         assert.equal(member.totalArrearsRepaid, 0n);
@@ -758,7 +763,7 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
       }
       assert.equal(await ethers.provider.getBalance(await contract.getAddress()), balance);
       const afterGroup = await contract.getGroupDetails(groupId);
-      assert.equal(afterGroup.status, GROUP.ACTIVE);
+      assert.equal(afterGroup.status, groupComplete ? GROUP.COMPLETED : GROUP.ACTIVE);
       if (number < group.targetMembers) {
         assert.equal(afterGroup.currentRound, number + 1n);
         const next = await contract.getRoundDetails(groupId, number + 1n);
@@ -952,26 +957,26 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
       assert.equal((await contract.getGroupDetails(1)).status, GROUP.ACTIVE);
       assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.OUTSTANDING);
       await failSettlement("Round is not collecting");
-      await reverts(contract.contribute(1, { value: AMOUNT }), "Round is not collecting");
+      await reverts(contract.connect(bob).contribute(1, { value: AMOUNT }), "Round is not collecting");
     });
 
     for (const funded of [true, false]) {
-      it(`leaves the final ${funded ? "fully funded" : "zero-funded"} round settled and group ACTIVE without completion or another round`, async function () {
+      it(`leaves the final ${funded ? "fully funded" : "zero-funded"} round settled with ${funded ? "completion" : "unresolved obligations"} and no extra round`, async function () {
         for (let number = 1; number <= 3; number++) {
           if (funded) await fundAll();
           else await expire();
           await settleAndCheck(funded ? [] : wallets.map((wallet) => wallet.address));
         }
         const group = await contract.getGroupDetails(1);
-        assert.equal(group.status, GROUP.ACTIVE);
+        assert.equal(group.status, funded ? GROUP.COMPLETED : GROUP.ACTIVE);
         assert.equal(group.currentRound, 3n);
         for (const wallet of wallets) {
           const member = await contract.getMemberDetails(1, wallet.address);
-          assert.equal(member.status, funded ? MEMBER.ACTIVE : MEMBER.OUTSTANDING);
+          assert.equal(member.status, funded ? MEMBER.COMPLETED : MEMBER.OUTSTANDING);
           assert.equal(member.defaultCount, funded ? 0n : 3n);
           assert.equal(member.outstandingArrears, funded ? 0n : 3n * AMOUNT);
         }
-        await failSettlement("Round is not collecting");
+        await failSettlement(funded ? "Group is not active" : "Round is not collecting");
       });
     }
 
@@ -1004,6 +1009,441 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
     });
   });
 
+  describe("Iteration 4 arrears, withdrawals, and completion", function () {
+    let wallets;
+    beforeEach(async function () {
+      await create();
+      await activate();
+      wallets = [creator, alice, bob];
+    });
+
+    async function pay(wallet, groupId = 1) {
+      await (await contract.connect(wallet).contribute(groupId, { value: AMOUNT })).wait();
+    }
+
+    async function settle(missing = [], groupId = 1) {
+      for (const wallet of wallets) if (!missing.includes(wallet)) await pay(wallet, groupId);
+      if (missing.length) {
+        const group = await contract.getGroupDetails(groupId);
+        const round = await contract.getRoundDetails(groupId, group.currentRound);
+        await network.provider.send("evm_setNextBlockTimestamp", [Number(round.graceDeadline + 1n)]);
+      }
+      const receipt = await (await contract.connect(outsider).settleRound(groupId)).wait();
+      await invariant(groupId);
+      return receipt;
+    }
+
+    function names(receipt) {
+      return receipt.logs.map((log) => contract.interface.parseLog(log).name);
+    }
+
+    async function invariant(groupId = 1) {
+      const group = await contract.getGroupDetails(groupId);
+      for (let number = 1; number <= Number(group.targetMembers); number++) {
+        const round = await contract.getRoundDetails(groupId, number);
+        if (round.status === 2n) {
+          assert.equal(round.initiallyCollected + round.recoveredArrears + round.outstandingShortfall, round.expectedAmount);
+        }
+      }
+    }
+
+    async function snapshot() {
+      const result = { group: Array.from(await contract.getGroupDetails(1)), rounds: [], records: [], members: [], allocations: [] };
+      for (let number = 1; number <= 4; number++) {
+        result.rounds.push(Array.from(await contract.getRoundDetails(1, number)));
+        for (const wallet of wallets) result.records.push(Array.from(await contract.getContributionRecord(1, number, wallet.address)));
+      }
+      for (const wallet of wallets) {
+        result.members.push(Array.from(await contract.getMemberDetails(1, wallet.address)));
+        result.allocations.push(await contract.getWithdrawableBalance(wallet.address));
+      }
+      result.custody = await ethers.provider.getBalance(await contract.getAddress());
+      return result;
+    }
+
+    async function failRepayment(wallet, roundNumber, value, message, groupId = 1) {
+      const before = await snapshot();
+      await reverts(contract.connect(wallet).repayArrears(groupId, roundNumber, { value }), message);
+      assert.deepEqual(await snapshot(), before);
+    }
+
+    async function repayAndCheck(wallet, number, groupId = 1) {
+      const before = await contract.getContributionRecord(groupId, number, wallet.address);
+      const memberBefore = await contract.getMemberDetails(groupId, wallet.address);
+      const roundBefore = await contract.getRoundDetails(groupId, number);
+      const custody = await ethers.provider.getBalance(await contract.getAddress());
+      const allocations = await Promise.all(wallets.map((w) => contract.getWithdrawableBalance(w.address)));
+      const recipientNative = await ethers.provider.getBalance(roundBefore.recipient);
+      const receipt = await (await contract.connect(wallet).repayArrears(groupId, number, { value: AMOUNT })).wait();
+      const timestamp = BigInt((await ethers.provider.getBlock(receipt.blockNumber)).timestamp);
+      const record = await contract.getContributionRecord(groupId, number, wallet.address);
+      assert.deepEqual(Array.from(record), [before.contributed, before.late, true, true,
+        before.contributionTimestamp, before.defaultTimestamp, timestamp]);
+      const member = await contract.getMemberDetails(groupId, wallet.address);
+      assert.equal(member.totalArrearsRepaid, memberBefore.totalArrearsRepaid + AMOUNT);
+      assert.equal(member.outstandingArrears, memberBefore.outstandingArrears - AMOUNT);
+      assert.equal(member.defaultCount, memberBefore.defaultCount);
+      assert.equal(member.totalContributed, memberBefore.totalContributed);
+      const group = await contract.getGroupDetails(groupId);
+      const finished = group.currentRound === group.targetMembers
+        && (await contract.getRoundDetails(groupId, group.targetMembers)).status === 2n;
+      assert.equal(member.status, member.outstandingArrears > 0n ? MEMBER.OUTSTANDING : finished ? MEMBER.COMPLETED : MEMBER.ACTIVE);
+      const round = await contract.getRoundDetails(groupId, number);
+      for (const field of ["number", "recipient", "startTime", "contributionDeadline", "graceDeadline", "expectedAmount", "initiallyCollected", "contributionCount", "status"]) {
+        assert.equal(round[field], roundBefore[field]);
+      }
+      assert.equal(round.recoveredArrears, roundBefore.recoveredArrears + AMOUNT);
+      assert.equal(round.outstandingShortfall, roundBefore.outstandingShortfall - AMOUNT);
+      for (const [index, w] of wallets.entries()) {
+        assert.equal(await contract.getWithdrawableBalance(w.address), allocations[index]
+          + (w.address === round.recipient ? AMOUNT : 0n));
+      }
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), custody + AMOUNT);
+      if (round.recipient !== wallet.address) {
+        assert.equal(await ethers.provider.getBalance(round.recipient), recipientNative);
+      }
+      const args = event(receipt, "ArrearsRepaid");
+      assert.equal(args.groupId, BigInt(groupId));
+      assert.equal(args.roundNumber, BigInt(number));
+      assert.equal(args.member, wallet.address);
+      assert.equal(args.recipient, round.recipient);
+      assert.equal(args.amount, AMOUNT);
+      assert.equal(names(receipt).includes("PayoutAllocated"), false);
+      await invariant(groupId);
+      return receipt;
+    }
+
+    async function withdrawAndCheck(wallet) {
+      const amount = await contract.getWithdrawableBalance(wallet.address);
+      const native = await ethers.provider.getBalance(wallet.address);
+      const custody = await ethers.provider.getBalance(await contract.getAddress());
+      const receipt = await (await contract.connect(wallet).withdrawPayout()).wait();
+      assert.equal(await contract.getWithdrawableBalance(wallet.address), 0n);
+      assert.equal(await ethers.provider.getBalance(wallet.address), native + amount - receipt.gasUsed * receipt.gasPrice);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), custody - amount);
+      assert.deepEqual(names(receipt), ["PayoutWithdrawn"]);
+      const args = event(receipt, "PayoutWithdrawn");
+      assert.equal(args.recipient, wallet.address);
+      assert.equal(args.amount, amount);
+      return amount;
+    }
+
+    function completions(receipt, expectedMembers, groupComplete) {
+      const logs = receipt.logs.map((log) => contract.interface.parseLog(log));
+      const members = logs.filter((log) => log.name === "MemberCompleted");
+      assert.deepEqual(members.map((log) => log.args.member), expectedMembers.map((w) => w.address));
+      for (const log of members) assert.equal(log.args.groupId, 1n);
+      const groups = logs.filter((log) => log.name === "GroupCompleted");
+      assert.equal(groups.length, groupComplete ? 1 : 0);
+      if (groupComplete) assert.equal(groups[0].args.groupId, 1n);
+    }
+
+    it("repays an exact historical default, preserves evidence, and restores ACTIVE before rotation ends", async function () {
+      await settle([bob]);
+      const receipt = await repayAndCheck(bob, 1);
+      assert.deepEqual(names(receipt), ["ArrearsRepaid"]);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.ACTIVE);
+      await pay(bob);
+      assert.equal((await contract.getContributionRecord(1, 2, bob.address)).contributed, true);
+      await invariant();
+    });
+
+    it("rejects repayment of nonexistent groups", async function () {
+      for (const id of [0, 2]) await failRepayment(bob, 1, AMOUNT, "Group does not exist", id);
+    });
+
+    it("rejects a non-member and a member without that historical default", async function () {
+      await settle([bob]);
+      await failRepayment(outsider, 1, AMOUNT, "Not a member");
+      await failRepayment(alice, 1, AMOUNT, "No default to repay");
+      assert.equal((await contract.getContributionRecord(1, 1, bob.address)).arrearsRepaid, false);
+    });
+
+    for (const cancelled of [false, true]) {
+      it(`rejects repayment in an ${cancelled ? "CANCELLED" : "OPEN"} group`, async function () {
+        await contract.createGroup("No arrears", 3, AMOUNT, DURATION, GRACE);
+        if (cancelled) await contract.cancelGroup(2);
+        await failRepayment(creator, 1, AMOUNT, "Group cannot resolve arrears", 2);
+      });
+    }
+
+    for (const number of [0, 4, 255]) {
+      it(`rejects invalid repayment round ${number}`, async function () {
+        await settle([bob]);
+        await failRepayment(bob, number, AMOUNT, "Invalid round number");
+      });
+    }
+
+    for (const number of [1, 2]) {
+      it(`rejects repayment of ${number === 1 ? "collecting" : "uninitialized"} round`, async function () {
+        await failRepayment(bob, number, AMOUNT, "Round is not settled");
+      });
+    }
+
+    for (const [label, value] of [["zero", 0n], ["underpayment", AMOUNT - 1n], ["overpayment", AMOUNT + 1n]]) {
+      it(`rejects ${label} repayment with every record, total, and balance unchanged`, async function () {
+        await settle([bob]);
+        await failRepayment(bob, 1, value, "Incorrect repayment amount");
+      });
+    }
+
+    it("rejects a duplicate repayment without changing timestamps or accounting", async function () {
+      await settle([bob]);
+      await repayAndCheck(bob, 1);
+      await failRepayment(bob, 1, AMOUNT, "Arrears already repaid");
+    });
+
+    it("independently repays multiple historical arrears and remains OUTSTANDING until the last is cleared", async function () {
+      await settle([bob]);
+      await settle([bob]);
+      const second = await contract.getContributionRecord(1, 2, bob.address);
+      const secondRound = await contract.getRoundDetails(1, 2);
+      await repayAndCheck(bob, 1);
+      assert.deepEqual(Array.from(await contract.getContributionRecord(1, 2, bob.address)), Array.from(second));
+      assert.deepEqual(Array.from(await contract.getRoundDetails(1, 2)), Array.from(secondRound));
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.OUTSTANDING);
+      const receipt = await repayAndCheck(bob, 2);
+      assert.deepEqual(names(receipt), ["ArrearsRepaid"]);
+      const member = await contract.getMemberDetails(1, bob.address);
+      assert.equal(member.totalArrearsRepaid, 2n * AMOUNT);
+      assert.equal(member.outstandingArrears, 0n);
+      assert.equal(member.defaultCount, 2n);
+      assert.equal(member.status, MEMBER.ACTIVE); // Final round is collecting, not settled.
+    });
+
+    it("credits the original non-creator recipient rather than the current recipient or creator", async function () {
+      await settle();
+      await settle([bob]);
+      assert.equal((await contract.getRoundDetails(1, 2)).recipient, alice.address);
+      assert.equal((await contract.getRoundDetails(1, 3)).recipient, bob.address);
+      await repayAndCheck(bob, 2);
+      assert.equal(await contract.getWithdrawableBalance(alice.address), 3n * AMOUNT);
+      assert.equal(await contract.getWithdrawableBalance(creator.address), 3n * AMOUNT);
+      assert.equal(await contract.getWithdrawableBalance(bob.address), 0n);
+    });
+
+    it("credits self-arrears back to the original recipient without suppressing historical recovery", async function () {
+      await settle([creator]);
+      await repayAndCheck(creator, 1);
+      assert.equal(await contract.getWithdrawableBalance(creator.address), 3n * AMOUNT);
+      assert.equal((await contract.getRoundDetails(1, 1)).outstandingShortfall, 0n);
+      assert.equal((await contract.getContributionRecord(1, 1, creator.address)).defaulted, true);
+    });
+
+    it("keeps the per-round invariant during partial recovery of several distinct whole arrears", async function () {
+      await settle([alice, bob]);
+      await repayAndCheck(alice, 1);
+      const partial = await contract.getRoundDetails(1, 1);
+      assert.equal(partial.initiallyCollected, AMOUNT);
+      assert.equal(partial.recoveredArrears, AMOUNT);
+      assert.equal(partial.outstandingShortfall, AMOUNT);
+      await repayAndCheck(bob, 1);
+      const full = await contract.getRoundDetails(1, 1);
+      assert.equal(full.initiallyCollected + full.recoveredArrears, full.expectedAmount);
+      assert.equal(full.outstandingShortfall, 0n);
+    });
+
+    it("completes all members and the group once on fully funded final settlement despite unwithdrawn payouts", async function () {
+      completions(await settle(), [], false);
+      completions(await settle(), [], false);
+      const receipt = await settle();
+      completions(receipt, wallets, true);
+      assert.deepEqual(names(receipt), ["RoundSettled", "PayoutAllocated", "MemberCompleted", "MemberCompleted", "MemberCompleted", "GroupCompleted"]);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+      assert.equal((await contract.getGroupDetails(1)).currentRound, 3n);
+      assert.equal((await contract.getRoundDetails(1, 4)).number, 0n);
+      for (const wallet of wallets) {
+        assert.equal((await contract.getMemberDetails(1, wallet.address)).status, MEMBER.COMPLETED);
+        assert.equal(await contract.getWithdrawableBalance(wallet.address), 3n * AMOUNT);
+      }
+      await reverts(contract.settleRound(1), "Group is not active");
+      await reverts(contract.contribute(1, { value: AMOUNT }), "Group is not active");
+      await failRepayment(alice, 1, AMOUNT, "No default to repay");
+    });
+
+    it("completes clear members at final settlement and automatically completes the last debtor after repayment", async function () {
+      await settle();
+      await settle();
+      completions(await settle([bob]), [creator, alice], false);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.ACTIVE);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.OUTSTANDING);
+      const receipt = await repayAndCheck(bob, 3);
+      completions(receipt, [bob], true);
+      assert.deepEqual(names(receipt), ["ArrearsRepaid", "MemberCompleted", "GroupCompleted"]);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+      await failRepayment(bob, 3, AMOUNT, "Arrears already repaid");
+      for (const wallet of wallets) await withdrawAndCheck(wallet); // No completion re-emission.
+    });
+
+    it("does not complete a debtor after only one of two post-rotation repayments", async function () {
+      await settle([bob]);
+      await settle([bob]);
+      completions(await settle(), [creator, alice], false);
+      completions(await repayAndCheck(bob, 1), [], false);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.ACTIVE);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.OUTSTANDING);
+      completions(await repayAndCheck(bob, 2), [bob], true);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).defaultCount, 2n);
+    });
+
+    it("waits for every debtor while completing each member only once", async function () {
+      await settle([alice, bob]);
+      await settle();
+      completions(await settle(), [creator], false);
+      completions(await repayAndCheck(alice, 1), [alice], false);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.ACTIVE);
+      assert.equal((await contract.getMemberDetails(1, alice.address)).status, MEMBER.COMPLETED);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.OUTSTANDING);
+      completions(await repayAndCheck(bob, 1), [bob], true);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+    });
+
+    it("rejects zero-balance withdrawal and remains usable afterward", async function () {
+      const before = await snapshot();
+      await reverts(contract.connect(outsider).withdrawPayout(), "No payout to withdraw");
+      assert.deepEqual(await snapshot(), before);
+      await settle();
+      await withdrawAndCheck(creator);
+      await reverts(contract.withdrawPayout(), "No payout to withdraw");
+    });
+
+    it("withdraws the entire allocation with gas-adjusted native balance and unchanged historical accounting", async function () {
+      await settle();
+      const round = await contract.getRoundDetails(1, 1);
+      const member = await contract.getMemberDetails(1, creator.address);
+      assert.equal(await withdrawAndCheck(creator), 3n * AMOUNT);
+      assert.deepEqual(Array.from(await contract.getRoundDetails(1, 1)), Array.from(round));
+      assert.deepEqual(Array.from(await contract.getMemberDetails(1, creator.address)), Array.from(member));
+      await invariant();
+    });
+
+    it("allows an OUTSTANDING recipient to withdraw without debt netting", async function () {
+      await settle([creator]);
+      assert.equal(await withdrawAndCheck(creator), 2n * AMOUNT);
+      const member = await contract.getMemberDetails(1, creator.address);
+      assert.equal(member.outstandingArrears, AMOUNT);
+      assert.equal(member.status, MEMBER.OUTSTANDING);
+    });
+
+    it("allows withdrawal after member and group completion", async function () {
+      await settle();
+      await settle();
+      await settle();
+      for (const wallet of wallets) await withdrawAndCheck(wallet);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), 0n);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+    });
+
+    it("withdraws accumulated allocations across groups and recovery in one call, then accepts future allocations", async function () {
+      await settle([bob]);
+      await contract.createGroup("More allocations", 3, AMOUNT, DURATION, GRACE);
+      for (const wallet of [alice, bob]) {
+        await contract.connect(wallet).requestJoin(2);
+        await contract.approveJoinRequest(2, wallet.address);
+      }
+      await settle([], 2);
+      await repayAndCheck(bob, 1);
+      assert.equal(await withdrawAndCheck(creator), 6n * AMOUNT);
+      // A new historical recovery can fund the same wallet after its previous withdrawal.
+      // A third group keeps this allocation independent of the first two groups.
+      await contract.createGroup("Future recovery", 3, AMOUNT, DURATION, GRACE);
+      for (const wallet of [alice, bob]) {
+        await contract.connect(wallet).requestJoin(3);
+        await contract.approveJoinRequest(3, wallet.address);
+      }
+      await settle([bob], 3);
+      assert.equal(await withdrawAndCheck(creator), 2n * AMOUNT);
+      await repayAndCheck(bob, 1, 3);
+      assert.equal(await withdrawAndCheck(creator), AMOUNT);
+      await invariant(2);
+      await invariant(3);
+    });
+
+    async function receiverAllocation() {
+      const receiver = await ethers.deployContract("WithdrawalReceiver", [await contract.getAddress()]);
+      await receiver.waitForDeployment();
+      await receiver.createGroup(AMOUNT, DURATION, GRACE);
+      for (const wallet of [alice, bob]) {
+        await contract.connect(wallet).requestJoin(2);
+        await receiver.approve(2, wallet.address);
+      }
+      for (const wallet of [alice, bob]) await pay(wallet, 2);
+      const round = await contract.getRoundDetails(2, 1);
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(round.graceDeadline + 1n)]);
+      await contract.settleRound(2);
+      assert.equal(await contract.getWithdrawableBalance(await receiver.getAddress()), 2n * AMOUNT);
+      return receiver;
+    }
+
+    it("restores allocation and custody on rejected transfer and releases the guard for a later successful withdrawal", async function () {
+      const receiver = await receiverAllocation();
+      const address = await receiver.getAddress();
+      const balance = await ethers.provider.getBalance(await contract.getAddress());
+      await reverts(receiver.withdraw(1), "Payout transfer failed");
+      assert.equal(await contract.getWithdrawableBalance(address), 2n * AMOUNT);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), balance);
+      assert.equal(await receiver.received(), 0n);
+      const receipt = await (await receiver.withdraw(0)).wait();
+      assert.equal(event(receipt, "PayoutWithdrawn").recipient, address);
+      assert.equal(await contract.getWithdrawableBalance(address), 0n);
+      assert.equal(await receiver.received(), 2n * AMOUNT);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), balance - 2n * AMOUNT);
+    });
+
+    it("zeros allocation before callback and blocks malicious nested withdrawal without draining another recipient", async function () {
+      await settle(); // An unrelated victim's allocation remains in custody during the attack.
+      const receiver = await receiverAllocation();
+      const receipt = await (await receiver.withdraw(2)).wait();
+      assert.equal(await receiver.balanceDuringCallback(), 0n);
+      assert.equal(await receiver.nestedSucceeded(), false);
+      const result = await receiver.nestedResult();
+      assert.equal(result.slice(0, 10), "0x08c379a0");
+      assert.equal(ethers.AbiCoder.defaultAbiCoder().decode(["string"], `0x${result.slice(10)}`)[0], "Withdrawal reentrancy");
+      assert.equal(await receiver.received(), 2n * AMOUNT);
+      assert.equal(event(receipt, "PayoutWithdrawn").amount, 2n * AMOUNT);
+      assert.equal(await contract.getWithdrawableBalance(await receiver.getAddress()), 0n);
+      assert.equal(await contract.getWithdrawableBalance(creator.address), 3n * AMOUNT);
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), 3n * AMOUNT);
+      await reverts(receiver.withdraw(2), "No payout to withdraw");
+      await withdrawAndCheck(creator);
+    });
+
+    it("runs a complete three-member lifecycle, recovers a historical default, completes, and withdraws every payout", async function () {
+      await settle([bob]);
+      const defaultBefore = await contract.getContributionRecord(1, 1, bob.address);
+      await settle(); // OUTSTANDING Bob can still participate in Round 2.
+      await repayAndCheck(bob, 1);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).status, MEMBER.ACTIVE);
+      completions(await settle(), wallets, true);
+      const before = await snapshot();
+      for (const wallet of wallets) assert.equal(await withdrawAndCheck(wallet), 3n * AMOUNT);
+      const after = await snapshot();
+      assert.deepEqual(after.rounds, before.rounds);
+      assert.deepEqual(after.records, before.records);
+      assert.deepEqual(after.members, before.members);
+      assert.deepEqual(after.group, before.group);
+      assert.equal(after.custody, 0n);
+      const evidence = await contract.getContributionRecord(1, 1, bob.address);
+      assert.equal(evidence.defaulted, true);
+      assert.equal(evidence.defaultTimestamp, defaultBefore.defaultTimestamp);
+      assert.equal(evidence.arrearsRepaid, true);
+      assert.equal((await contract.getMemberDetails(1, bob.address)).defaultCount, 1n);
+      assert.equal((await contract.getGroupDetails(1)).status, GROUP.COMPLETED);
+      await invariant();
+    });
+
+    it("uses the required indexed fields for recovery, withdrawal, and completion events", async function () {
+      const fields = {
+        ArrearsRepaid: [true, true, true, false, false], PayoutWithdrawn: [true, false],
+        MemberCompleted: [true, true], GroupCompleted: [true],
+      };
+      for (const [name, expected] of Object.entries(fields)) {
+        assert.deepEqual(contract.interface.getEvent(name).inputs.map((input) => input.indexed), expected);
+      }
+    });
+  });
+
   describe("existence checks and ABI scope", function () {
     const calls = [
       ["requestJoin", []], ["approveJoinRequest", [ethers.ZeroAddress]],
@@ -1021,7 +1461,7 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
       });
     }
 
-    it("exposes exactly the Iteration 3 interface with contribute as the only payable entry point", async function () {
+    it("exposes exactly the Iteration 4 interface and only the two intended payable entry points", async function () {
       const { abi } = await artifacts.readArtifact("ChainROSCA");
       const functions = abi.filter((item) => item.type === "function");
       assert.deepEqual(functions.map((item) => item.name).sort(), [
@@ -1029,20 +1469,25 @@ describe("ChainROSCA — Iterations 1 to 3", function () {
         "getGroupDetails", "getMembers", "getMemberDetails", "getJoinRequests", "getJoinRequestStatus", "getRoundDetails",
         "contribute", "getContributionRecord",
         "settleRound", "getWithdrawableBalance",
+        "repayArrears", "withdrawPayout",
       ].sort());
-      for (const name of ["startGroup", "repayArrears", "withdrawPayout"]) {
+      for (const name of ["startGroup", "completeGroup"]) {
         assert.equal(functions.some((item) => item.name === name), false, `${name} must be absent`);
       }
-      assert.deepEqual(functions.filter((item) => item.stateMutability === "payable").map((item) => item.name), ["contribute"]);
+      assert.deepEqual(functions.filter((item) => item.stateMutability === "payable").map((item) => item.name).sort(), ["contribute", "repayArrears"]);
       assert.equal(abi.some((item) => item.type === "receive" || item.type === "fallback"), false);
       assert.deepEqual(functions.find((item) => item.name === "contribute").inputs.map((item) => item.type), ["uint256"]);
       assert.equal(functions.find((item) => item.name === "settleRound").stateMutability, "nonpayable");
+      assert.equal(functions.find((item) => item.name === "withdrawPayout").stateMutability, "nonpayable");
+      assert.deepEqual(functions.find((item) => item.name === "withdrawPayout").inputs, []);
+      assert.deepEqual(functions.find((item) => item.name === "repayArrears").inputs.map((item) => item.type), ["uint256", "uint8"]);
       assert.deepEqual(functions.find((item) => item.name === "settleRound").inputs.map((item) => item.type), ["uint256"]);
       assert.deepEqual(functions.find((item) => item.name === "getContributionRecord").inputs.map((item) => item.type), ["uint256", "uint8", "address"]);
       assert.deepEqual(abi.filter((item) => item.type === "event").map((item) => item.name).sort(), [
         "GroupCreated", "JoinRequested", "JoinApproved", "JoinRejected", "MemberJoined", "GroupStarted", "GroupCancelled",
         "ContributionMade", "LateContributionMade",
         "MemberDefaulted", "RoundSettled", "PayoutAllocated",
+        "ArrearsRepaid", "PayoutWithdrawn", "MemberCompleted", "GroupCompleted",
       ].sort());
     });
   });
