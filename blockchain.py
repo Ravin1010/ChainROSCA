@@ -23,11 +23,12 @@ WEI_FIELDS = {"contributionAmount", "totalContributed", "totalArrearsRepaid",
               "outstandingArrears", "expectedAmount", "initiallyCollected",
               "recoveredArrears", "outstandingShortfall", "amount"}
 PRIMARY_EVENTS = {
-    "createGroup": "GroupCreated", "requestJoin": "JoinRequested",
-    "approveJoinRequest": "JoinApproved", "rejectJoinRequest": "JoinRejected",
-    "cancelGroup": "GroupCancelled", "contribute": "ContributionMade",
-    "settleRound": "RoundSettled", "repayArrears": "ArrearsRepaid",
-    "withdrawPayout": "PayoutWithdrawn",
+    "createGroup": {"GroupCreated"}, "requestJoin": {"JoinRequested"},
+    "approveJoinRequest": {"JoinApproved"}, "rejectJoinRequest": {"JoinRejected"},
+    "cancelGroup": {"GroupCancelled"},
+    "contribute": {"ContributionMade", "LateContributionMade"},
+    "settleRound": {"RoundSettled"}, "repayArrears": {"ArrearsRepaid"},
+    "withdrawPayout": {"PayoutWithdrawn"},
 }
 
 
@@ -229,7 +230,7 @@ class BlockchainService:
                                "txHash": tx_hash, "blockNumber": receipt["blockNumber"],
                                "transactionIndex": receipt["transactionIndex"], "logIndex": log["logIndex"],
                                "blockTimestamp": block["timestamp"], "args": safe_value(args), "createdAt": created_at})
-            if PRIMARY_EVENTS[function.fn_name] not in [e["eventName"] for e in events]:
+            if not PRIMARY_EVENTS[function.fn_name].intersection(e["eventName"] for e in events):
                 raise ValueError("Expected event missing")
         except Exception:
             raise APIError("UNINTERPRETABLE_TX", "Transaction call/events do not match the authoritative ABI.", 422) from None

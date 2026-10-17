@@ -364,6 +364,47 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result['events'][0]['recipient'], B)
         self.assertEqual(result['events'][0]['amountWei'], str(AMOUNT))
 
+    def test_on_time_contribution_primary_event_accepted(self):
+        service, _, _, _ = verifier_fixture('contribute', [7], [
+            ('ContributionMade', {'groupId': 7, 'roundNumber': 2, 'member': A, 'amount': AMOUNT})])
+        client = create_app({}, blockchain=service, database=self.store).test_client()
+        response = client.post('/api/transactions', json={'txHash': HASH})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['indexed'])
+        self.assertEqual(response.json['transaction']['functionName'], 'contribute')
+        self.assertEqual(response.json['events'][0]['eventName'], 'ContributionMade')
+
+    def test_late_contribution_primary_event_and_metadata_accepted(self):
+        service, _, _, _ = verifier_fixture('contribute', [7], [
+            ('LateContributionMade', {'groupId': 7, 'roundNumber': 2, 'member': A, 'amount': AMOUNT})])
+        client = create_app({}, blockchain=service, database=self.store).test_client()
+        response = client.post('/api/transactions', json={'txHash': HASH})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['indexed'])
+        transaction, event = response.json['transaction'], response.json['events'][0]
+        self.assertEqual(transaction['functionName'], 'contribute')
+        self.assertEqual(transaction['groupId'], 7)
+        self.assertEqual(transaction['roundNumber'], 2)
+        self.assertEqual(transaction['wallet'], A)
+        self.assertEqual(event['eventName'], 'LateContributionMade')
+        self.assertEqual((event['groupId'], event['roundNumber'], event['wallet']), (7, 2, A))
+        self.assertEqual(event['args']['member'], A)
+        self.assertEqual(event['amountWei'], str(AMOUNT))
+        self.assertEqual(event['args']['amount'], str(AMOUNT))
+        self.assertEqual(len(self.db.transactions.documents), 1)
+        self.assertEqual(len(self.db.events.documents), 1)
+
+    def test_contribute_without_expected_contribution_event_rejected(self):
+        for events in ([], [('GroupStarted', {'groupId': 7})]):
+            with self.subTest(events=events):
+                service, _, _, _ = verifier_fixture('contribute', [7], events)
+                client = create_app({}, blockchain=service, database=self.store).test_client()
+                response = client.post('/api/transactions', json={'txHash': HASH})
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.json['error']['code'], 'UNINTERPRETABLE_TX')
+                self.assertEqual(self.db.transactions.documents, [])
+                self.assertEqual(self.db.events.documents, [])
+
     def test_receipt_or_canonical_block_mismatch(self):
         self.w3.eth.get_block.return_value['hash'] = HexBytes('0x' + '99' * 32)
         self.assertEqual(self.post().status_code, 409)
