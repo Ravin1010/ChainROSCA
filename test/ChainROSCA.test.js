@@ -8,7 +8,7 @@ const AMOUNT = ethers.parseEther("0.01");
 const DURATION = 3600n;
 const GRACE = 600n;
 
-describe("ChainROSCA — Iterations 1 to 4", function () {
+describe("ChainROSCA — Iterations 1 to 5", function () {
   let contract, creator, alice, bob, carol, dave, outsider;
 
   beforeEach(async function () {
@@ -1548,6 +1548,489 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
         await reverts(contract.getJoinRequestCount(id), "Group does not exist");
         await reverts(contract.getJoinRequestsPage(id, 0, 20), "Group does not exist");
       }
+    });
+  });
+
+  describe("Iteration 5 adversarial and independent accounting checks", function () {
+    // Full-rotation cases make many local RPC assertions; allow slower CI hosts.
+    this.timeout(20000);
+    let models, allocations, expectedCustody, seenEvents;
+    const gas = {};
+
+    beforeEach(function () {
+      models = new Map();
+      allocations = new Map();
+      expectedCustody = 0n;
+      seenEvents = new Set();
+    });
+
+    function credit(wallet, amount) {
+      allocations.set(wallet, (allocations.get(wallet) || 0n) + amount);
+    }
+
+    function logs(receipt) {
+      return receipt.logs.map((log) => contract.interface.parseLog(log));
+    }
+
+    function uniqueEvents(receipt) {
+      for (const log of logs(receipt)) {
+        const args = log.args;
+        let key;
+        if (["GroupCreated", "GroupStarted", "GroupCancelled", "GroupCompleted"].includes(log.name)) {
+          key = `${log.name}:${args.groupId}`;
+        } else if (["RoundSettled", "PayoutAllocated"].includes(log.name)) {
+          key = `${log.name}:${args.groupId}:${args.roundNumber}`;
+        } else if (["MemberDefaulted", "ArrearsRepaid"].includes(log.name)) {
+          key = `${log.name}:${args.groupId}:${args.roundNumber}:${args.member}`;
+        } else if (["MemberJoined", "MemberCompleted"].includes(log.name)) {
+          key = `${log.name}:${args.groupId}:${args.member}`;
+        }
+        if (key) {
+          assert.equal(seenEvents.has(key), false, `Repeated transition event ${key}`);
+          seenEvents.add(key);
+        }
+      }
+    }
+
+    // This model is driven by successful test actions, not contract totals.
+    async function check() {
+      let collectingCustody = 0n;
+      for (const [id, model] of models) {
+        const group = await contract.getGroupDetails(id);
+        assert.equal(group.currentRound, BigInt(model.current));
+        const debts = new Map(model.wallets.map((wallet) => [wallet.address, 0n]));
+        const defaults = new Map(model.wallets.map((wallet) => [wallet.address, 0n]));
+        const paid = new Map(model.wallets.map((wallet) => [wallet.address, 0n]));
+        const repaid = new Map(model.wallets.map((wallet) => [wallet.address, 0n]));
+        for (let number = 1; number <= model.wallets.length; number++) {
+          const round = await contract.getRoundDetails(id, number);
+          const state = model.rounds.get(number);
+          if (!state) {
+            assert.equal(round.number, 0n);
+            assert.equal(round.status, 0n);
+            continue;
+          }
+          const received = BigInt(state.payments.size) * model.amount;
+          const recovered = BigInt(state.repayments.size) * model.amount;
+          const expected = BigInt(model.wallets.length) * model.amount;
+          assert.equal(round.number, BigInt(number));
+          assert.equal(round.recipient, model.wallets[number - 1].address);
+          assert.equal(round.startTime, state.start);
+          assert.equal(round.contributionDeadline, state.start + DURATION);
+          assert.equal(round.graceDeadline, state.start + DURATION + GRACE);
+          assert.equal(round.expectedAmount, expected);
+          assert.equal(round.initiallyCollected, received);
+          assert.equal(round.contributionCount, BigInt(state.payments.size));
+          assert.equal(round.recoveredArrears, recovered);
+          assert.equal(round.status, state.settled ? 2n : 1n);
+          if (state.settled) {
+            const originalShortfall = expected - received;
+            assert.ok(recovered <= originalShortfall);
+            assert.ok(round.outstandingShortfall >= 0n);
+            assert.equal(round.outstandingShortfall, originalShortfall - recovered);
+            assert.equal(received + recovered + round.outstandingShortfall, expected);
+          } else {
+            assert.equal(round.outstandingShortfall, 0n);
+            collectingCustody += received;
+          }
+          for (const wallet of model.wallets) {
+            const address = wallet.address;
+            const record = await contract.getContributionRecord(id, number, address);
+            const payment = state.payments.get(address);
+            const defaulted = state.settled && !payment;
+            const repayment = state.repayments.get(address);
+            assert.deepEqual(Array.from(record), [Boolean(payment), payment?.late || false,
+              Boolean(defaulted), Boolean(repayment), payment?.time || 0n,
+              defaulted ? state.settled : 0n, repayment || 0n]);
+            if (payment) paid.set(address, paid.get(address) + model.amount);
+            if (defaulted) defaults.set(address, defaults.get(address) + 1n);
+            if (defaulted && !repayment) debts.set(address, debts.get(address) + model.amount);
+            if (repayment) repaid.set(address, repaid.get(address) + model.amount);
+          }
+        }
+        const finished = Boolean(model.rounds.get(model.wallets.length)?.settled);
+        const allClear = [...debts.values()].every((amount) => amount === 0n);
+        assert.equal(group.status, finished && allClear ? GROUP.COMPLETED : GROUP.ACTIVE);
+        for (const [index, wallet] of model.wallets.entries()) {
+          const member = await contract.getMemberDetails(id, wallet.address);
+          assert.equal(member.exists, true);
+          assert.equal(member.payoutRound, BigInt(index + 1));
+          assert.equal(member.defaultCount, defaults.get(wallet.address));
+          assert.equal(member.outstandingArrears, debts.get(wallet.address));
+          assert.equal(member.totalContributed, paid.get(wallet.address));
+          assert.equal(member.totalArrearsRepaid, repaid.get(wallet.address));
+          assert.equal(member.status, debts.get(wallet.address) > 0n ? MEMBER.OUTSTANDING : finished ? MEMBER.COMPLETED : MEMBER.ACTIVE);
+        }
+      }
+      let allocated = 0n;
+      for (const [wallet, amount] of allocations) {
+        assert.equal(await contract.getWithdrawableBalance(wallet), amount);
+        allocated += amount;
+      }
+      assert.equal(await ethers.provider.getBalance(await contract.getAddress()), expectedCustody);
+      assert.equal(expectedCustody, allocated + collectingCustody);
+    }
+
+    function freshRound(start) {
+      return { start, payments: new Map(), repayments: new Map(), settled: 0n };
+    }
+
+    async function trackedGroup(wallets, amount = AMOUNT) {
+      const id = Number(await contract.groupCount()) + 1;
+      const receipt = await (await contract.connect(wallets[0]).createGroup("Invariant circle", wallets.length, amount, DURATION, GRACE)).wait();
+      uniqueEvents(receipt);
+      for (const wallet of [...wallets.slice(1), outsider]) {
+        const requestReceipt = await (await contract.connect(wallet).requestJoin(id)).wait();
+        assert.equal(event(requestReceipt, "JoinRequested").applicant, wallet.address);
+      }
+      let activation;
+      for (const wallet of wallets.slice(1)) {
+        activation = await (await contract.connect(wallets[0]).approveJoinRequest(id, wallet.address)).wait();
+        uniqueEvents(activation);
+        assert.equal(event(activation, "JoinApproved").applicant, wallet.address);
+        event(activation, "MemberJoined");
+      }
+      assert.equal(event(activation, "GroupStarted").groupId, BigInt(id));
+      const start = BigInt((await ethers.provider.getBlock(activation.blockNumber)).timestamp);
+      models.set(id, { wallets, amount, current: 1, rounds: new Map([[1, freshRound(start)]]) });
+      for (const wallet of wallets) if (!allocations.has(wallet.address)) allocations.set(wallet.address, 0n);
+      await check();
+      return { id, activation };
+    }
+
+    async function contribute(id, wallet) {
+      const model = models.get(id);
+      const receipt = await (await contract.connect(wallet).contribute(id, { value: model.amount })).wait();
+      const time = BigInt((await ethers.provider.getBlock(receipt.blockNumber)).timestamp);
+      const state = model.rounds.get(model.current);
+      const late = time > state.start + DURATION;
+      state.payments.set(wallet.address, { time, late });
+      expectedCustody += model.amount;
+      assert.deepEqual(logs(receipt).map((log) => log.name), [late ? "LateContributionMade" : "ContributionMade"]);
+      await check();
+      return receipt;
+    }
+
+    async function settle(id) {
+      const model = models.get(id);
+      const number = model.current;
+      const state = model.rounds.get(number);
+      const receipt = await (await contract.connect(outsider).settleRound(id)).wait();
+      state.settled = BigInt((await ethers.provider.getBlock(receipt.blockNumber)).timestamp);
+      credit(model.wallets[number - 1].address, BigInt(state.payments.size) * model.amount);
+      if (number < model.wallets.length) {
+        model.current++;
+        model.rounds.set(model.current, freshRound(state.settled));
+      }
+      uniqueEvents(receipt);
+      const missing = model.wallets.filter((wallet) => !state.payments.has(wallet.address));
+      const defaults = logs(receipt).filter((log) => log.name === "MemberDefaulted");
+      assert.deepEqual(defaults.map((log) => log.args.member), missing.map((wallet) => wallet.address));
+      event(receipt, "RoundSettled");
+      event(receipt, "PayoutAllocated");
+      await check();
+      return receipt;
+    }
+
+    async function repay(id, number, wallet) {
+      const model = models.get(id);
+      const receipt = await (await contract.connect(wallet).repayArrears(id, number, { value: model.amount })).wait();
+      const time = BigInt((await ethers.provider.getBlock(receipt.blockNumber)).timestamp);
+      const state = model.rounds.get(number);
+      assert.equal(state.repayments.has(wallet.address), false);
+      state.repayments.set(wallet.address, time);
+      expectedCustody += model.amount;
+      credit(model.wallets[number - 1].address, model.amount);
+      uniqueEvents(receipt);
+      const args = event(receipt, "ArrearsRepaid");
+      assert.equal(args.recipient, model.wallets[number - 1].address);
+      assert.equal(logs(receipt).some((log) => log.name === "PayoutAllocated"), false);
+      await check();
+      return receipt;
+    }
+
+    async function withdraw(wallet) {
+      const amount = allocations.get(wallet.address) || 0n;
+      const receipt = await (await contract.connect(wallet).withdrawPayout()).wait();
+      allocations.set(wallet.address, 0n);
+      expectedCustody -= amount;
+      assert.deepEqual(logs(receipt).map((log) => log.name), ["PayoutWithdrawn"]);
+      assert.equal(event(receipt, "PayoutWithdrawn").amount, amount);
+      await check();
+      return receipt;
+    }
+
+    async function expire(id) {
+      const model = models.get(id);
+      const start = model.rounds.get(model.current).start;
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(start + DURATION + GRACE + 1n)]);
+    }
+
+    async function groupSnapshot(id) {
+      const group = await contract.getGroupDetails(id);
+      const addresses = Array.from(await contract.getMembers(id));
+      const result = { group: Array.from(group), addresses,
+        requests: Array.from(await contract.getJoinRequestsPage(id, 0, 20), (values) => Array.from(values)),
+        count: await contract.getJoinRequestCount(id), members: [], rounds: [], records: [] };
+      for (const address of [...addresses, outsider.address]) {
+        result.members.push(Array.from(await contract.getMemberDetails(id, address)));
+        for (let number = 1; number <= Number(group.targetMembers); number++) {
+          result.records.push(Array.from(await contract.getContributionRecord(id, number, address)));
+        }
+      }
+      for (let number = 1; number <= Number(group.targetMembers); number++) {
+        result.rounds.push(Array.from(await contract.getRoundDetails(id, number)));
+      }
+      return result;
+    }
+
+    async function reject(action, message) {
+      const before = await Promise.all([...models.keys()].map(groupSnapshot));
+      await reverts(action(), message);
+      assert.deepEqual(await Promise.all([...models.keys()].map(groupSnapshot)), before);
+      await check();
+    }
+
+    for (const cancelled of [false, true]) {
+      it(`rejects all financial entry paths for ${cancelled ? "CANCELLED" : "OPEN"} groups without accepting ETH`, async function () {
+        await create();
+        if (cancelled) await contract.cancelGroup(1);
+        const before = await groupSnapshot(1);
+        await reject(() => contract.contribute(1, { value: AMOUNT }), "Group is not active");
+        await reject(() => contract.settleRound(1), "Group is not active");
+        await reject(() => contract.repayArrears(1, 1, { value: AMOUNT }), "Group cannot resolve arrears");
+        assert.deepEqual(await groupSnapshot(1), before);
+      });
+    }
+
+    it("enforces creator-only membership decisions while allowing public creation and self requests", async function () {
+      await contract.connect(alice).createGroup("Alice owns this", 3, AMOUNT, DURATION, GRACE);
+      await contract.connect(bob).requestJoin(1);
+      const before = await groupSnapshot(1);
+      for (const caller of [creator, bob, outsider]) {
+        for (const method of ["approveJoinRequest", "rejectJoinRequest", "cancelGroup"]) {
+          const args = method === "cancelGroup" ? [1] : [1, bob.address];
+          await reverts(contract.connect(caller)[method](...args), "Creator only");
+          assert.deepEqual(await groupSnapshot(1), before);
+        }
+      }
+      event(await (await contract.connect(alice).rejectJoinRequest(1, bob.address)).wait(), "JoinRejected");
+      await contract.connect(bob).requestJoin(1);
+      assert.equal(await contract.getJoinRequestCount(1), 1n);
+    });
+
+    for (const size of [3, 4, 5]) {
+      it(`preserves independent financial, debt, history, event, and custody invariants through a ${size}-member rotation`, async function () {
+        const wallets = [creator, alice, bob, carol, dave].slice(0, size);
+        const { id } = await trackedGroup(wallets);
+        for (let number = 1; number <= size; number++) {
+          // The last member misses rounds 1 and 2; another member also misses round 1.
+          const missing = number === 1 ? [wallets[size - 1], wallets[1]] : number === 2 ? [wallets[size - 1]] : [];
+          for (const wallet of wallets) if (!missing.includes(wallet)) await contribute(id, wallet);
+          if (missing.length) await expire(id);
+          await settle(id);
+          if (number === 2) {
+            // Reverse historical order while the next round is still collecting.
+            await repay(id, 2, wallets[size - 1]);
+            await reject(() => contract.connect(wallets[size - 1]).repayArrears(id, 2, { value: AMOUNT }), "Arrears already repaid");
+            await repay(id, 1, wallets[1]);
+          }
+        }
+        assert.equal((await contract.getGroupDetails(id)).status, GROUP.ACTIVE);
+        const completion = await repay(id, 1, wallets[size - 1]);
+        event(completion, "MemberCompleted");
+        event(completion, "GroupCompleted");
+        for (const wallet of wallets) {
+          await withdraw(wallet);
+          await reject(() => contract.connect(wallet).withdrawPayout(), "No payout to withdraw");
+        }
+        assert.equal(expectedCustody, 0n);
+        await reject(() => contract.contribute(id, { value: AMOUNT }), "Group is not active");
+        await reject(() => contract.settleRound(id), "Group is not active");
+        await reject(() => contract.connect(wallets[size - 1]).repayArrears(id, 1, { value: AMOUNT }), "Arrears already repaid");
+      });
+    }
+
+    it("isolates complete group-local snapshots while shared-wallet allocations accumulate and withdraw globally", async function () {
+      const { id: a } = await trackedGroup([creator, alice, bob]);
+      const { id: b } = await trackedGroup([creator, carol, dave], 2n * AMOUNT);
+      const beforeB = await groupSnapshot(b);
+      await contribute(a, creator);
+      await contribute(a, alice);
+      await expire(a);
+      await settle(a);
+      await repay(a, 1, bob);
+      assert.deepEqual(await groupSnapshot(b), beforeB);
+      const beforeA = await groupSnapshot(a);
+      for (const wallet of [creator, carol, dave]) await contribute(b, wallet);
+      await settle(b);
+      assert.deepEqual(await groupSnapshot(a), beforeA);
+      const settledB = await groupSnapshot(b);
+      assert.equal(allocations.get(creator.address), 9n * AMOUNT);
+      await withdraw(creator);
+      assert.deepEqual(await groupSnapshot(a), beforeA);
+      assert.deepEqual(await groupSnapshot(b), settledB);
+      assert.equal(await contract.getWithdrawableBalance(creator.address), 0n);
+    });
+
+    it("keeps historical timestamps and other rounds immutable during out-of-order repayment", async function () {
+      const { id } = await trackedGroup([creator, alice, bob]);
+      await contribute(id, creator);
+      await contribute(id, alice);
+      await expire(id);
+      await settle(id);
+      assert.deepEqual(Array.from(await contract.getContributionRecord(id, 2, bob.address)), [false, false, false, false, 0n, 0n, 0n]);
+      await contribute(id, creator);
+      await contribute(id, alice);
+      await expire(id);
+      await settle(id);
+      const first = await contract.getRoundDetails(id, 1);
+      const third = await contract.getRoundDetails(id, 3);
+      const recordOne = await contract.getContributionRecord(id, 1, bob.address);
+      await repay(id, 2, bob);
+      assert.deepEqual(Array.from(await contract.getRoundDetails(id, 1)), Array.from(first));
+      assert.deepEqual(Array.from(await contract.getRoundDetails(id, 3)), Array.from(third));
+      assert.deepEqual(Array.from(await contract.getContributionRecord(id, 1, bob.address)), Array.from(recordOne));
+      const second = await contract.getRoundDetails(id, 2);
+      const recordTwo = await contract.getContributionRecord(id, 2, bob.address);
+      await repay(id, 1, bob);
+      assert.deepEqual(Array.from(await contract.getRoundDetails(id, 2)), Array.from(second));
+      assert.deepEqual(Array.from(await contract.getContributionRecord(id, 2, bob.address)), Array.from(recordTwo));
+      assert.ok(recordTwo.defaultTimestamp > recordOne.defaultTimestamp);
+      for (const number of [1, 2]) await reject(() => contract.connect(bob).repayArrears(id, number, { value: AMOUNT }), "Arrears already repaid");
+    });
+
+    it("rechecks all contribution boundaries with a custody model and rejects the post-grace payment", async function () {
+      const { id } = await trackedGroup([creator, alice, bob, carol]);
+      const start = models.get(id).rounds.get(1).start;
+      for (const [wallet, timestamp] of [[creator, start + DURATION], [alice, start + DURATION + 1n], [bob, start + DURATION + GRACE]]) {
+        await network.provider.send("evm_setNextBlockTimestamp", [Number(timestamp)]);
+        await contribute(id, wallet);
+      }
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(start + DURATION + GRACE + 1n)]);
+      await reject(() => contract.connect(carol).contribute(id, { value: AMOUNT, gasLimit: 500000 }), "Grace deadline has passed");
+      await settle(id);
+    });
+
+    it("rejects underfunded settlement exactly at grace and permits it exactly one second later", async function () {
+      const { id } = await trackedGroup([creator, alice, bob]);
+      await contribute(id, alice);
+      const grace = models.get(id).rounds.get(1).start + DURATION + GRACE;
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(grace)]);
+      await reject(() => contract.settleRound(id, { gasLimit: 1000000 }), "Settlement is not ready");
+      await network.provider.send("evm_setNextBlockTimestamp", [Number(grace + 1n)]);
+      await settle(id);
+      assert.equal(models.get(id).rounds.get(1).settled, grace + 1n);
+    });
+
+    it("rejects outsider, duplicate, wrong-value, and arbitrary-deposit attempts without custody or state changes", async function () {
+      const { id } = await trackedGroup([creator, alice, bob]);
+      await reject(() => contract.connect(outsider).contribute(id, { value: AMOUNT }), "Not a member");
+      await reject(() => contract.connect(outsider).repayArrears(id, 1, { value: AMOUNT }), "Not a member");
+      await reject(() => contract.contribute(id, { value: AMOUNT + 1n }), "Incorrect contribution amount");
+      await contribute(id, creator);
+      await reject(() => contract.contribute(id, { value: AMOUNT }), "Already contributed");
+      await expire(id);
+      await settle(id);
+      await reject(() => contract.settleRound(id), "Settlement is not ready");
+      await reject(() => contract.repayArrears(id, 1, { value: AMOUNT }), "No default to repay");
+      await reject(() => contract.connect(bob).repayArrears(id, 1, { value: AMOUNT - 1n }), "Incorrect repayment amount");
+      const before = await groupSnapshot(id);
+      await assert.rejects(outsider.sendTransaction({ to: await contract.getAddress(), value: AMOUNT }));
+      assert.deepEqual(await groupSnapshot(id), before);
+      await check();
+      await reject(() => contract.connect(outsider).withdrawPayout(), "No payout to withdraw");
+      assert.equal(await contract.getWithdrawableBalance(creator.address), AMOUNT);
+    });
+
+    it("permits a defaulting recipient's withdrawal and self-recovery without debt netting", async function () {
+      const { id } = await trackedGroup([creator, alice, bob]);
+      await contribute(id, alice);
+      await contribute(id, bob);
+      await expire(id);
+      await settle(id);
+      await withdraw(creator);
+      assert.equal((await contract.getMemberDetails(id, creator.address)).outstandingArrears, AMOUNT);
+      await repay(id, 1, creator);
+      assert.equal(allocations.get(creator.address), AMOUNT);
+      await withdraw(creator);
+      assert.equal((await contract.getContributionRecord(id, 1, creator.address)).defaulted, true);
+    });
+
+    it("rejects contributions and repeat settlement at a final settled round while allowing completed members to withdraw", async function () {
+      const { id } = await trackedGroup([creator, alice, bob]);
+      for (let number = 1; number <= 3; number++) {
+        await contribute(id, creator);
+        await contribute(id, alice);
+        await expire(id);
+        await settle(id);
+      }
+      await reject(() => contract.connect(bob).contribute(id, { value: AMOUNT }), "Round is not collecting");
+      await reject(() => contract.settleRound(id), "Round is not collecting");
+      assert.equal((await contract.getMemberDetails(id, creator.address)).status, MEMBER.COMPLETED);
+      await withdraw(creator);
+    });
+
+    it("preserves modeled custody on rejected and reentrant receiver callbacks while protecting another wallet's allocation", async function () {
+      const { id: victim } = await trackedGroup([creator, alice, bob]);
+      for (const wallet of [creator, alice, bob]) await contribute(victim, wallet);
+      await settle(victim);
+      const receiver = await ethers.deployContract("WithdrawalReceiver", [await contract.getAddress()]);
+      await receiver.waitForDeployment();
+      const address = await receiver.getAddress();
+      uniqueEvents(await (await receiver.createGroup(AMOUNT, DURATION, GRACE)).wait());
+      const id = Number(await contract.groupCount());
+      let activation;
+      for (const wallet of [alice, bob]) {
+        await contract.connect(wallet).requestJoin(id);
+        activation = await (await receiver.approve(id, wallet.address)).wait();
+        uniqueEvents(activation);
+      }
+      const start = BigInt((await ethers.provider.getBlock(activation.blockNumber)).timestamp);
+      models.set(id, { wallets: [{ address }, alice, bob], amount: AMOUNT, current: 1,
+        rounds: new Map([[1, freshRound(start)]]) });
+      allocations.set(address, 0n);
+      await check();
+      await contribute(id, alice);
+      await contribute(id, bob);
+      await expire(id);
+      await settle(id);
+      await reject(() => receiver.withdraw(1), "Payout transfer failed");
+      assert.equal(await receiver.received(), 0n);
+      const receipt = await (await receiver.withdraw(2)).wait();
+      assert.equal(await receiver.balanceDuringCallback(), 0n);
+      assert.equal(await receiver.nestedSucceeded(), false);
+      const result = await receiver.nestedResult();
+      assert.equal(result.slice(0, 10), "0x08c379a0");
+      assert.equal(ethers.AbiCoder.defaultAbiCoder().decode(["string"], `0x${result.slice(10)}`)[0], "Withdrawal reentrancy");
+      assert.equal(event(receipt, "PayoutWithdrawn").amount, 2n * AMOUNT);
+      assert.equal(await receiver.received(), 2n * AMOUNT);
+      allocations.set(address, 0n);
+      expectedCustody -= 2n * AMOUNT;
+      await check();
+      await reject(() => receiver.withdraw(2), "No payout to withdraw");
+      assert.equal(await contract.getWithdrawableBalance(creator.address), 3n * AMOUNT);
+      await withdraw(creator);
+    });
+
+    it("measures max-size gas without arbitrary thresholds while checking all financial invariants", async function () {
+      const wallets = [creator, alice, bob, carol, dave];
+      const { id, activation } = await trackedGroup(wallets);
+      gas.activation = activation.gasUsed.toString();
+      gas.contribution = (await contribute(id, creator)).gasUsed.toString();
+      for (const wallet of wallets.slice(1)) await contribute(id, wallet);
+      gas.fullSettlement = (await settle(id)).gasUsed.toString();
+      await expire(id);
+      gas.zeroFundedSettlement = (await settle(id)).gasUsed.toString();
+      gas.arrearsRepayment = (await repay(id, 2, creator)).gasUsed.toString();
+      for (const wallet of wallets.slice(1)) await repay(id, 2, wallet);
+      for (let number = 3; number <= 5; number++) {
+        for (const wallet of wallets) await contribute(id, wallet);
+        const receipt = await settle(id);
+        if (number === 5) gas.finalCompletionSettlement = receipt.gasUsed.toString();
+      }
+      gas.withdrawal = (await withdraw(creator)).gasUsed.toString();
+      console.log("      Iteration 5 gasUsed:", JSON.stringify(gas));
     });
   });
 
