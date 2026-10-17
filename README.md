@@ -4,7 +4,7 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 5 — contract test and security hardening completed.**
+**Current status: Iteration 6 — Sepolia deployment, verification, and minimal smoke test completed.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
@@ -23,18 +23,75 @@ original recipient while preserving default history. Global payouts can be
 withdrawn in full with checks/effects/interactions and a local reentrancy guard.
 Completion is automatic once the final round settles and all arrears are cleared;
 unwithdrawn payouts do not block it. The core Solidity lifecycle is implemented.
-Flask, MongoDB, frontend integration, and deployment remain later work.
+Flask, MongoDB, frontend integration, and Render hosting remain later work.
 
 Join-request history uses `getJoinRequestCount(groupId)` and
 `getJoinRequestsPage(groupId, offset, limit)` with pages of 1–20 entries.
 These replace the full-list getter without capping the total number of applicants.
+
+## Iteration 6 Sepolia deployment
+
+ChainROSCA is deployed once on Sepolia (chain ID **11155111**) at
+[`0xF3cd73c19b49b58dFa743fB3165Aa753e839b422`](https://sepolia.etherscan.io/address/0xF3cd73c19b49b58dFa743fB3165Aa753e839b422#code),
+with **verified source**. The
+[deployment transaction](https://sepolia.etherscan.io/tx/0x061154a8273fa4670d44df2099a4860356013a46222c20555493c5842e1aa96b)
+was confirmed in block 11931482, using deployer nonce 140.
+
+The local and on-chain runtime match exactly: **13,133 bytes**, keccak256
+`0xef43d8a6310c47ab4a105c3f3c96c06b576bb17fb2e91ace2104c090bb4461dc`.
+Production Solidity is unchanged from frozen source commit
+`aa46959ec406e336c58bdc6c343c335a7433caa4`. Solidity 0.8.28, optimizer 200 runs,
+and no viaIR are retained. Only the pinned compiler's build identifier is normalized
+by stripping `.Emscripten.clang` for Etherscan; the compiler package/binary is unchanged.
+
+The membership-only smoke test passed for Group 1, `ChainROSCA Sepolia Smoke`:
+three members, approval-based payout order, ACTIVE status, and Round 1 COLLECTING
+with the deployer as recipient. Both temporary member keys existed only in memory.
+No contribution, settlement, default, arrears repayment, or withdrawal was performed.
+
+Smoke transactions use staged live-state estimation, a rounded-up 20% gas-limit
+margin, fresh fee data, and rolling balance/reserve checks. After group creation,
+balance-only read-only state overrides estimate join requests before funding;
+funded requests and each approval are then independently re-estimated. Temporary
+wallet funding covers only request gas with a 50% balance margin.
+
+`deployment/sepolia.json` records deployment, verification, exact bytecode identity,
+and all seven smoke transaction hashes, gas estimates/limits, receipts, funding
+amounts, and public member addresses. `static/abi/ChainROSCA.json` is the ABI array
+exported from the exact production artifact. The final local regression passes
+**164/164 tests**.
+
+The only added development dependency is `@nomicfoundation/hardhat-verify` 2.1.3
+(Hardhat 2 compatible), using Etherscan V2. Ordinary compilation/tests need no
+secrets. Supply credentials only through the ignored local `.env` or environment;
+`.env.example` has empty placeholders. Never store keys or credential-bearing URLs
+in logs, metadata, or Git.
+
+```sh
+npx hardhat clean
+npm run compile
+npm test
+npm run export:abi
+```
+
+An existing deployment journal blocks another deployment. Transaction hashes and
+nonces are journaled before broadcast. If confirmation is uncertain, inspect the
+transaction, receipt, nonce, and state before any further action. Do not rerun the
+completed deployment or smoke sequence. Temporary keys are not persisted, so a
+partial smoke sequence requires inspection rather than automatic replacement.
+Flask, MongoDB, frontend integration, and Render remain later work.
+
+After the verifier addition, `npm audit` reports 21 affected development dependency
+entries (8 high, 2 moderate, 11 low); `npm audit --omit=dev` reports zero. The added
+verifier entry inherits findings through Hardhat, Undici, and ethers v5 ABI tooling.
+No automatic audit fixes or frozen-toolchain upgrades were performed.
 
 ## Technology stack
 
 - GitHub repository/workspace and version control
 - Solidity 0.8.28, Hardhat 2 with JavaScript configuration, and Ethers.js 6
 - Flask / Python with Web3.py; HTML, CSS, and JavaScript
-- Later: Ethereum Sepolia, MetaMask, minimal MongoDB, and Render hosting
+- Ethereum Sepolia; later: MetaMask, minimal MongoDB, and Render hosting
 
 ## Node / Hardhat setup
 
@@ -53,7 +110,7 @@ contributions, timing boundaries, accounting, custody, and Iteration 3 settlemen
 defaults, payout allocations, round progression, and Iteration 4 repayment,
 withdrawal safety, completion, and ABI scope. `contracts/test/WithdrawalReceiver.sol`
 is a test-only receiver for failed transfers and reentrancy checks.
-No deployment scripts or Sepolia network are configured in this iteration.
+Sepolia tooling and deployment evidence are described above.
 
 ## Security/testing status
 
@@ -120,7 +177,7 @@ paths. Network/provider and malicious-input tooling exposure warrants review
 before remote deployment; this is not a claim that the tooling is vulnerability-free.
 Review compatible Mocha/diff/serialize-javascript patches and the Hardhat dependency
 chain later; npm also proposes major Hardhat/plugin migrations for some findings.
-No fixes, upgrades, or dependency changes were applied. Deployment remains future work.
+No fixes, upgrades, or dependency changes were applied during Iteration 5.
 
 ## Python / Flask setup
 
@@ -135,14 +192,14 @@ python -m flask --app app run
 
 Open http://127.0.0.1:5000/ to view the baseline page. No blockchain or MongoDB
 credentials are needed. Gunicorn is included for later Render deployment;
-nothing is deployed.
+the Flask application is not deployed.
 
 ## Environment and repository layout
 
 `.env.example` contains blank anticipated configuration values. If needed later,
 copy it to `.env` and supply local values. **Never commit secrets or private keys.**
 
-- `contracts/`, `test/`, `scripts/`, `deployment/`: Solidity and future tooling
+- `contracts/`, `test/`, `scripts/`, `deployment/`: Solidity and deployment tooling
 - `templates/`, `static/css/`, `static/js/`, `static/abi/`: Flask frontend assets
 - `app.py`: minimal home route
 - `blockchain.py`, `database.py`: inactive integration placeholders

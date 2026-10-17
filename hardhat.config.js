@@ -1,5 +1,6 @@
 require("dotenv").config();
 require("@nomicfoundation/hardhat-ethers");
+require("@nomicfoundation/hardhat-verify");
 
 const { subtask } = require("hardhat/config");
 const { TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD } = require("hardhat/builtin-tasks/task-names");
@@ -11,7 +12,7 @@ subtask(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD).setAction(async ({ solcVersion }, 
       compilerPath: require.resolve("solc/soljson.js"),
       isSolcJs: true,
       version: solcVersion,
-      longVersion: require("solc").version(),
+      longVersion: require("solc").version().replace(/\.Emscripten\.clang$/, ""),
     };
   }
   return runSuper();
@@ -27,5 +28,13 @@ module.exports = {
       },
     },
   },
-  // Sepolia configuration will be added in a later iteration.
+  networks: {
+    sepolia: {
+      url: process.env.SEPOLIA_RPC_URL || "http://127.0.0.1:8545",
+      chainId: 11155111,
+      // Deployment scripts construct the signer after sanitized credential checks.
+      accounts: [],
+    },
+  },
+  etherscan: { apiKey: process.env.ETHERSCAN_API_KEY || "" },
 };
