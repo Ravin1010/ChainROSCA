@@ -162,7 +162,7 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
         event(await request(alice), "JoinRequested");
         assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.PENDING);
       }
-      const [addresses, statuses] = await contract.getJoinRequests(1);
+      const [addresses, statuses] = await contract.getJoinRequestsPage(1, 0, 20);
       assert.deepEqual(Array.from(addresses), [alice.address, bob.address]);
       assert.deepEqual(Array.from(statuses), [REQUEST.PENDING, REQUEST.PENDING]);
     });
@@ -180,7 +180,7 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
       await request(carol);
       await approve(bob);
       await contract.rejectJoinRequest(1, alice.address);
-      const [addresses, statuses] = await contract.getJoinRequests(1);
+      const [addresses, statuses] = await contract.getJoinRequestsPage(1, 0, 20);
       assert.deepEqual(Array.from(addresses), [alice.address, bob.address, carol.address]);
       assert.deepEqual(Array.from(statuses), [REQUEST.REJECTED, REQUEST.APPROVED, REQUEST.PENDING]);
     });
@@ -1444,12 +1444,119 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
     });
   });
 
+  describe("bounded join-request pagination correction", function () {
+    let requesters;
+
+    before(async function () {
+      requesters = Array.from({ length: 25 }, () => ethers.Wallet.createRandom().connect(ethers.provider));
+    });
+
+    beforeEach(async function () { await create(); });
+
+    async function populate() {
+      for (const wallet of requesters) {
+        await network.provider.send("hardhat_setBalance", [wallet.address, "0xde0b6b3a7640000"]);
+        await (await contract.connect(wallet).requestJoin(1)).wait();
+      }
+    }
+
+    function assertPage(page, expected, statuses = expected.map(() => REQUEST.PENDING)) {
+      assert.deepEqual(Array.from(page.requestApplicants), expected.map((wallet) => wallet.address));
+      assert.deepEqual(Array.from(page.statuses), statuses);
+    }
+
+    it("returns zero count and empty pages before any request", async function () {
+      assert.equal(await contract.getJoinRequestCount(1), 0n);
+      assertPage(await contract.getJoinRequestsPage(1, 0, 20), []);
+      assertPage(await contract.getJoinRequestsPage(1, ethers.MaxUint256, 1), []);
+    });
+
+    it("counts only distinct applicants and preserves re-request deduplication and direct status reads", async function () {
+      assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.NONE);
+      await request(alice);
+      assert.equal(await contract.getJoinRequestCount(1), 1n);
+      assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.PENDING);
+      await reverts(contract.connect(alice).requestJoin(1), "Request already exists");
+      assert.equal(await contract.getJoinRequestCount(1), 1n);
+      await request(bob);
+      assert.equal(await contract.getJoinRequestCount(1), 2n);
+      await contract.rejectJoinRequest(1, alice.address);
+      assertPage(await contract.getJoinRequestsPage(1, 0, 20), [alice, bob], [REQUEST.REJECTED, REQUEST.PENDING]);
+      assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.REJECTED);
+      await request(alice);
+      assert.equal(await contract.getJoinRequestCount(1), 2n);
+      assertPage(await contract.getJoinRequestsPage(1, 0, 20), [alice, bob]);
+      assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.PENDING);
+      await approve(alice);
+      assert.equal(await contract.getJoinRequestCount(1), 2n);
+      assertPage(await contract.getJoinRequestsPage(1, 0, 20), [alice, bob], [REQUEST.APPROVED, REQUEST.PENDING]);
+      assert.equal(await contract.getJoinRequestStatus(1, alice.address), REQUEST.APPROVED);
+      assert.equal(await contract.getJoinRequestStatus(1, carol.address), REQUEST.NONE);
+    });
+
+    for (const [label, offset, limit, end] of [
+      ["first", 0, 10, 10], ["middle", 10, 10, 20], ["partial final", 20, 20, 25],
+    ]) {
+      it(`returns the correct ${label} page in insertion order`, async function () {
+        await populate();
+        assertPage(await contract.getJoinRequestsPage(1, offset, limit), requesters.slice(offset, end));
+      });
+    }
+
+    for (const offset of [25n, 26n, ethers.MaxUint256]) {
+      it(`returns empty arrays at ${offset === 25n ? "equal-to-total" : offset === 26n ? "beyond-total" : "maximum uint256"} offset without overflow`, async function () {
+        await populate();
+        assertPage(await contract.getJoinRequestsPage(1, offset, 20), []);
+      });
+    }
+
+    for (const limit of [0n, 21n, ethers.MaxUint256]) {
+      it(`rejects ${limit === ethers.MaxUint256 ? "maximum uint256" : limit} limit even for an empty or out-of-range page`, async function () {
+        await reverts(contract.getJoinRequestsPage(1, 0, limit), "Page limit must be 1 to 20");
+        await request(alice);
+        await reverts(contract.getJoinRequestsPage(1, ethers.MaxUint256, limit), "Page limit must be 1 to 20");
+      });
+    }
+
+    it("accepts limit 20 and histories beyond membership capacity without granting membership or capping applicants", async function () {
+      await populate();
+      assert.equal(await contract.getJoinRequestCount(1), 25n);
+      const group = await contract.getGroupDetails(1);
+      assert.equal(group.status, GROUP.OPEN);
+      assert.equal(group.targetMembers, 3n);
+      assert.equal(group.memberCount, 1n);
+      assertPage(await contract.getJoinRequestsPage(1, 0, 20), requesters.slice(0, 20));
+      assertPage(await contract.getJoinRequestsPage(1, 20, 20), requesters.slice(20));
+    });
+
+    it("accepts limit 1 and returns statuses from the current mapping across page boundaries", async function () {
+      await populate();
+      await contract.rejectJoinRequest(1, requesters[19].address);
+      assertPage(await contract.getJoinRequestsPage(1, 19, 1), [requesters[19]], [REQUEST.REJECTED]);
+      await (await contract.connect(requesters[19]).requestJoin(1)).wait();
+      await contract.approveJoinRequest(1, requesters[20].address);
+      assert.equal(await contract.getJoinRequestCount(1), 25n);
+      assertPage(await contract.getJoinRequestsPage(1, 19, 2), requesters.slice(19, 21), [REQUEST.PENDING, REQUEST.APPROVED]);
+      for (const index of [19, 20]) {
+        const page = await contract.getJoinRequestsPage(1, index, 1);
+        assert.equal(page.statuses[0], await contract.getJoinRequestStatus(1, requesters[index].address));
+      }
+    });
+
+    it("retains group existence checks for both new getters", async function () {
+      for (const id of [0, 2]) {
+        await reverts(contract.getJoinRequestCount(id), "Group does not exist");
+        await reverts(contract.getJoinRequestsPage(id, 0, 20), "Group does not exist");
+      }
+    });
+  });
+
   describe("existence checks and ABI scope", function () {
     const calls = [
       ["requestJoin", []], ["approveJoinRequest", [ethers.ZeroAddress]],
       ["rejectJoinRequest", [ethers.ZeroAddress]], ["cancelGroup", []],
       ["getGroupDetails", []], ["getMembers", []],
-      ["getMemberDetails", [ethers.ZeroAddress]], ["getJoinRequests", []],
+      ["getMemberDetails", [ethers.ZeroAddress]], ["getJoinRequestCount", []],
       ["getJoinRequestStatus", [ethers.ZeroAddress]], ["getRoundDetails", [1]],
     ];
     for (const [method, args] of calls) {
@@ -1466,12 +1573,12 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
       const functions = abi.filter((item) => item.type === "function");
       assert.deepEqual(functions.map((item) => item.name).sort(), [
         "groupCount", "createGroup", "requestJoin", "approveJoinRequest", "rejectJoinRequest", "cancelGroup",
-        "getGroupDetails", "getMembers", "getMemberDetails", "getJoinRequests", "getJoinRequestStatus", "getRoundDetails",
+        "getGroupDetails", "getMembers", "getMemberDetails", "getJoinRequestCount", "getJoinRequestsPage", "getJoinRequestStatus", "getRoundDetails",
         "contribute", "getContributionRecord",
         "settleRound", "getWithdrawableBalance",
         "repayArrears", "withdrawPayout",
       ].sort());
-      for (const name of ["startGroup", "completeGroup"]) {
+      for (const name of ["startGroup", "completeGroup", "getJoinRequests"]) {
         assert.equal(functions.some((item) => item.name === name), false, `${name} must be absent`);
       }
       assert.deepEqual(functions.filter((item) => item.stateMutability === "payable").map((item) => item.name).sort(), ["contribute", "repayArrears"]);
@@ -1483,6 +1590,9 @@ describe("ChainROSCA — Iterations 1 to 4", function () {
       assert.deepEqual(functions.find((item) => item.name === "repayArrears").inputs.map((item) => item.type), ["uint256", "uint8"]);
       assert.deepEqual(functions.find((item) => item.name === "settleRound").inputs.map((item) => item.type), ["uint256"]);
       assert.deepEqual(functions.find((item) => item.name === "getContributionRecord").inputs.map((item) => item.type), ["uint256", "uint8", "address"]);
+      assert.deepEqual(functions.find((item) => item.name === "getJoinRequestCount").inputs.map((item) => item.type), ["uint256"]);
+      assert.deepEqual(functions.find((item) => item.name === "getJoinRequestsPage").inputs.map((item) => item.type), ["uint256", "uint256", "uint256"]);
+      assert.deepEqual(functions.find((item) => item.name === "getJoinRequestStatus").inputs.map((item) => item.type), ["uint256", "address"]);
       assert.deepEqual(abi.filter((item) => item.type === "event").map((item) => item.name).sort(), [
         "GroupCreated", "JoinRequested", "JoinApproved", "JoinRejected", "MemberJoined", "GroupStarted", "GroupCancelled",
         "ContributionMade", "LateContributionMade",

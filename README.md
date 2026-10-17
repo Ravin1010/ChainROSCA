@@ -26,6 +26,10 @@ unwithdrawn payouts do not block it. The core Solidity lifecycle is implemented.
 Further testing/security hardening, Flask, MongoDB, frontend integration, and
 deployment remain later work.
 
+Join-request history uses `getJoinRequestCount(groupId)` and
+`getJoinRequestsPage(groupId, offset, limit)` with pages of 1–20 entries.
+These replace the full-list getter without capping the total number of applicants.
+
 ## Technology stack
 
 - GitHub repository/workspace and version control

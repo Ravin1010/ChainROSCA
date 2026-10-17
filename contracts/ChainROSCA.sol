@@ -55,6 +55,8 @@ contract ChainROSCA {
         uint256 repaymentTimestamp;
     }
 
+    uint256 private constant MAX_JOIN_REQUEST_PAGE_SIZE = 20;
+
     uint256 public groupCount;
     mapping(uint256 => Group) private groups;
     mapping(uint256 => mapping(address => Member)) private members;
@@ -370,13 +372,29 @@ contract ChainROSCA {
         return members[groupId][member];
     }
 
-    function getJoinRequests(uint256 groupId) external view groupExists(groupId)
+    function getJoinRequestCount(uint256 groupId) external view groupExists(groupId) returns (uint256) {
+        return applicants[groupId].length;
+    }
+
+    function getJoinRequestsPage(uint256 groupId, uint256 offset, uint256 limit)
+        external view groupExists(groupId)
         returns (address[] memory requestApplicants, JoinRequestStatus[] memory statuses)
     {
-        requestApplicants = applicants[groupId];
-        statuses = new JoinRequestStatus[](requestApplicants.length);
-        for (uint256 i = 0; i < requestApplicants.length; i++) {
-            statuses[i] = joinRequests[groupId][requestApplicants[i]];
+        require(limit > 0 && limit <= MAX_JOIN_REQUEST_PAGE_SIZE, "Page limit must be 1 to 20");
+        uint256 total = applicants[groupId].length;
+        uint256 count;
+        if (offset < total) {
+            count = total - offset;
+            if (count > limit) {
+                count = limit;
+            }
+        }
+        requestApplicants = new address[](count);
+        statuses = new JoinRequestStatus[](count);
+        for (uint256 i = 0; i < count; i++) {
+            address applicant = applicants[groupId][offset + i];
+            requestApplicants[i] = applicant;
+            statuses[i] = joinRequests[groupId][applicant];
         }
     }
 
