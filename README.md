@@ -4,7 +4,7 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 8 — responsive frontend and MetaMask/Ethers.js integration implemented.**
+**Current status: Iteration 10 — production deployment and final hosted validation completed.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
@@ -25,11 +25,33 @@ Completion is automatic once the final round settles and all arrears are cleared
 unwithdrawn payouts do not block it. The core Solidity lifecycle is implemented.
 The read-only Flask/Web3.py API and optional MongoDB history index are implemented.
 The responsive browser interface uses MetaMask for signing and direct Ethereum
-reads. Render deployment and Iteration 9 final integration remain later work.
+reads. Iteration 9 validated the complete live lifecycle; Iteration 10 validated
+hosted transactions, MongoDB indexing, idempotency, and persistence on Render.
 
 Join-request history uses `getJoinRequestCount(groupId)` and
 `getJoinRequestsPage(groupId, offset, limit)` with pages of 1–20 entries.
 These replace the full-list getter without capping the total number of applicants.
+
+## Production Deployment
+
+- **Render:** https://chainrosca.onrender.com (Singapore)
+- **Network:** Ethereum Sepolia, chain ID 11155111
+- **Contract:** [`0xF3cd73c19b49b58dFa743fB3165Aa753e839b422`](https://sepolia.etherscan.io/address/0xF3cd73c19b49b58dFa743fB3165Aa753e839b422#code)
+- **Validated implementation:** `57f9e52817425c43fd2972cff52a01a848518dcb`
+
+Ethereum is the authoritative financial state. MongoDB Atlas provides supplementary
+indexed history using a dedicated application user with `readWrite` only on
+`chainrosca`. Frontend signing remains user-wallet based; the backend holds no
+signing private key. Only the four backend runtime variables are configured on
+Render, and automatic deploys are disabled.
+
+The hosted smoke group (Group 3) was created and cancelled through the production
+UI. Both transactions were independently verified and indexed; same-hash retries
+created no duplicates. Two transaction documents and three events survived a
+same-SHA Render redeployment. Groups 1 and 2 remained unchanged. Desktop and 360px
+Chromium checks passed. See [Iteration 10 production evidence](docs/integration/iteration-10-production.md)
+and the earlier [Iteration 9 lifecycle evidence](docs/integration/iteration-9-happy-path.md).
+The final documentation/evidence commit does not trigger another deployment.
 
 ## Iteration 6 Sepolia deployment
 
@@ -289,17 +311,18 @@ suite. Offline tests cover validation/eligibility, receipt parsing, transaction
 and indexing states, account/network changes, duplicate-write prevention, final
 activation confirmation, history outages and safe text rendering.
 
-No live write, wallet funding, contract redeployment, MetaMask automation, MongoDB
-production setup, or Render deployment is performed in Iteration 8. Actual wallet
-approval and visual desktop/mobile browser validation remain user checks; no
-browser is installed in this workspace. Iteration 9 is not started.
+Iteration 8 introduced the frontend without live writes or production deployment.
+Iterations 9 and 10 subsequently validated the unchanged application using temporary
+Chromium tooling and an injected EIP-1193 test provider, including desktop/mobile
+views, the live lifecycle, and hosted MongoDB indexing/persistence. A real MetaMask
+extension approval screen was not automated.
 
 ## Technology stack
 
 - GitHub repository/workspace and version control
 - Solidity 0.8.28, Hardhat 2 with JavaScript configuration, and Ethers.js 6
 - Flask / Python with Web3.py; HTML, CSS, and JavaScript
-- Ethereum Sepolia; later: MetaMask, minimal MongoDB, and Render hosting
+- Ethereum Sepolia, MetaMask, MongoDB Atlas indexed history, and Render hosting
 
 ## Node / Hardhat setup
 
@@ -400,8 +423,8 @@ python -m flask --app app run
 
 Open http://127.0.0.1:5000/ to view the frontend. Startup and that page need
 no blockchain or MongoDB credentials; API reads/indexing use runtime configuration
-as described above. Gunicorn is included for later Render deployment;
-the Flask application is not deployed.
+as described above. The production Render service runs the existing application
+with `gunicorn app:app`; local development does not require deployment credentials.
 
 ## Environment and repository layout
 
