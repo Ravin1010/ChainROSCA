@@ -2,11 +2,44 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>ChainROSCA</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="ChainROSCA — trusted savings groups on Ethereum Sepolia.">
+  <title>ChainROSCA · Shared savings</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script defer src="https://cdn.jsdelivr.net/npm/ethers@6.17.0/dist/ethers.umd.min.js" crossorigin="anonymous"></script>
+  <script defer src="{{ url_for('static', filename='js/helpers.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='js/app.js') }}"></script>
 </head>
 <body>
-  <h1>ChainROSCA</h1>
-  <p>The development baseline is initialized.</p>
+  <a id="skip-to-content" class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#/dashboard" aria-label="ChainROSCA dashboard"><span class="brand-mark" aria-hidden="true">CR</span><span>ChainROSCA<small>Shared savings. Clear rules.</small></span></a>
+    <div class="wallet-controls">
+      <span class="badge" id="network-label">Sepolia testnet</span>
+      <button id="switch-network" hidden>Switch to Sepolia</button>
+      <button id="connect-wallet" class="primary">Connect MetaMask</button>
+      <button id="copy-address" hidden aria-label="Copy connected wallet address">Copy address</button>
+      <button id="refresh" aria-label="Refresh current live state">Refresh</button>
+    </div>
+  </header>
+  <div class="app-shell">
+    <nav aria-label="Primary navigation" class="primary-nav">
+      <a href="#/dashboard" data-view="dashboard">Dashboard</a>
+      <a href="#/create" data-view="create">Create Group</a>
+      <a href="#/history" data-view="history">History</a>
+    </nav>
+    <div class="workspace">
+      <div id="app-status" class="notice" role="status" aria-live="polite">Loading public configuration…</div>
+      <noscript><p class="notice error">Enable JavaScript to use the wallet interface.</p></noscript>
+      <section id="transaction-panel" class="panel transaction-panel" aria-labelledby="transaction-title" aria-live="polite" hidden>
+        <div class="section-heading"><h2 id="transaction-title">Transaction</h2><span id="transaction-stage" class="badge"></span></div>
+        <p id="transaction-message"></p>
+        <a id="transaction-link" target="_blank" rel="noopener noreferrer" hidden>View transaction on Etherscan</a>
+        <button id="check-confirmation" hidden>Check confirmation</button>
+      </section>
+      <main id="main" tabindex="-1"><section class="panel"><h1>Your savings, in order.</h1><p>Connect MetaMask to read live Sepolia groups. Connection alone does not send a transaction.</p></section></main>
+      <footer>Sepolia testnet · Test ETH only. Ethereum is the source of truth.<br>ChainROSCA is designed for trusted savings groups. Blockchain rules do not guarantee future contributions.</footer>
+    </div>
+  </div>
 </body>
 </html>

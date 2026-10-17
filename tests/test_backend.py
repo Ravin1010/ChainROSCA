@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -145,6 +146,37 @@ class ReadAPITests(unittest.TestCase):
 
     def test_baseline_page_retained(self):
         self.assertEqual(self.client.get('/').status_code, 200)
+
+    def test_responsive_template_scripts_and_accessible_controls(self):
+        class Tags(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.tags = []
+            def handle_starttag(self, tag, attrs):
+                self.tags.append((tag, dict(attrs)))
+        html = self.client.get('/').get_data(as_text=True)
+        parser = Tags()
+        parser.feed(html)
+        self.assertTrue(any(tag == 'meta' and attrs.get('name') == 'viewport'
+                            and attrs.get('content') == 'width=device-width, initial-scale=1'
+                            for tag, attrs in parser.tags))
+        scripts = [attrs['src'] for tag, attrs in parser.tags if tag == 'script']
+        self.assertEqual(scripts, ['https://cdn.jsdelivr.net/npm/ethers@6.17.0/dist/ethers.umd.min.js',
+                                   '/static/js/helpers.js', '/static/js/app.js'])
+        self.assertIn('Primary navigation', html)
+        for text in ('Dashboard', 'Create Group', 'History', 'Connect MetaMask', 'Refresh'):
+            self.assertIn(text, html)
+        self.assertIn('aria-live="polite"', html)
+
+    def test_frontend_has_no_private_configuration_or_html_injection_sink(self):
+        sources = [(ROOT / file).read_text() for file in ('templates/index.html', 'static/js/helpers.js', 'static/js/app.js')]
+        for source in sources:
+            for forbidden in ('SEPOLIA_RPC_URL', 'MONGODB_URI', 'DEPLOYER_PRIVATE_KEY', 'ETHERSCAN_API_KEY',
+                              'innerHTML', 'insertAdjacentHTML', 'localStorage', 'sessionStorage'):
+                self.assertNotIn(forbidden, source)
+            import re
+            for url in re.findall(r'https?://[^\s\'"<>]+', source):
+                self.assertTrue(url.startswith(('https://cdn.jsdelivr.net/npm/ethers@6.17.0/', 'https://sepolia.etherscan.io')))
 
     def test_public_config_allowlist(self):
         result = self.client.get('/api/config').json

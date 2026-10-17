@@ -4,7 +4,7 @@ A decentralized Rotating Savings and Credit Association financial DApp for the
 SC6113 individual assignment. This is a standalone project for small trusted
 savings groups.
 
-**Current status: Iteration 7 — Flask/Web3.py backend and optional MongoDB history index implemented.**
+**Current status: Iteration 8 — responsive frontend and MetaMask/Ethers.js integration implemented.**
 `contracts/ChainROSCA.sol` supports group creation (3–5 members), join requests,
 creator approval/rejection, approval-based payout order, and cancellation before
 activation. The creator is Member 1. Final approval automatically activates the
@@ -24,7 +24,8 @@ withdrawn in full with checks/effects/interactions and a local reentrancy guard.
 Completion is automatic once the final round settles and all arrears are cleared;
 unwithdrawn payouts do not block it. The core Solidity lifecycle is implemented.
 The read-only Flask/Web3.py API and optional MongoDB history index are implemented.
-Frontend/MetaMask integration and Render hosting remain later work.
+The responsive browser interface uses MetaMask for signing and direct Ethereum
+reads. Render deployment and Iteration 9 final integration remain later work.
 
 Join-request history uses `getJoinRequestCount(groupId)` and
 `getJoinRequestsPage(groupId, offset, limit)` with pages of 1–20 entries.
@@ -99,7 +100,7 @@ handles bounded validation, safe errors, and runtime-only configuration.
 join requests, arrears, and payout balances are read from Sepolia, never MongoDB.
 The backend never loads a signing key, signs, or sends a blockchain transaction.
 Future application writes belong to browser → Ethers.js → MetaMask → Sepolia;
-the Iteration 8 frontend is not implemented.
+the Iteration 8 frontend below now implements this browser signing boundary.
 
 Startup performs no RPC/Mongo connection. Blockchain calls lazily validate chain
 11155111, the authoritative address, nonempty runtime, exact 13,133-byte size and
@@ -128,7 +129,7 @@ contract, explorer, ABI path, and history-source configuration.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /` | Existing baseline template |
+| `GET /` | Responsive single-page frontend |
 | `GET /api/health` | Flask, chain/runtime, and optional Mongo availability |
 | `GET /api/config` | Public configuration only |
 | `GET /api/groups/<group_id>` | Live group configuration and status |
@@ -188,14 +189,110 @@ python -m unittest discover -s tests -p "test_*.py"
 python -m flask --app app run
 ```
 
-All **55 backend tests pass**, using `unittest`/mocks with no network, MongoDB,
-or private keys. The frozen Solidity regression also passes **164/164 tests**.
+Iteration 7 introduced 55 backend tests; its late-contribution correction raised
+the retained baseline to 58. Tests use `unittest`/mocks without network, MongoDB,
+or private keys. The frozen Solidity regression passes **164/164 tests**.
 GitHub Actions runs it in an independent Python 3.12 job alongside unchanged
 Hardhat compile/tests. Requirements and npm dependencies are unchanged in
 Iteration 7. A read-only Python integration check confirmed the existing live
 Group 1 is ACTIVE, current Round 1 COLLECTING, with three members and an exact
 runtime match; no transactions were signed/submitted. Live MongoDB testing was
 skipped because local MongoDB configuration was absent/incomplete.
+
+## Iteration 8 browser interface
+
+The Flask-served responsive MVP is implemented with vanilla HTML/CSS/JavaScript
+and the fixed Ethers.js **6.17.0 UMD** CDN distribution. No frontend framework,
+bundler, or additional npm dependency is used. If Ethers cannot load, a visible
+error keeps wallet actions disabled. The browser never receives the backend RPC
+URL or any MongoDB credentials. Backend implementation, Solidity, canonical ABI,
+and deployment evidence remain frozen.
+
+Views use hash navigation within `/` and survive refresh/deep linking:
+
+- `#/dashboard`: wallet ETH balance, global payout balance, My Groups and
+  Available/Open Groups from bounded discovery, plus direct Group ID lookup.
+- `#/create`: fixed group terms, 3–5 members, exact ETH amount, and integer-minute
+  round/grace durations; creation collects no contribution ETH.
+- `#/group/<id>`: group terms, exact member payout order and financial state,
+  current round/timing, connected-member contribution/default records, bounded
+  join requests, historical arrears, and optional indexed history.
+- `#/history`: wallet/recipient indexed event cards with Etherscan links.
+
+**MetaMask is required for live financial reads and writes.** On mobile, open the
+DApp inside the MetaMask mobile in-app browser. Connect is always user initiated;
+page load never requests accounts. The interface uses MetaMask's selected RPC
+through `BrowserProvider`; the signer delegates signing to MetaMask. Flask never
+holds wallet private keys. Only Sepolia (11155111 / `0xaa36a7`) is allowed. A wrong
+network clears live action controls and offers `wallet_switchEthereumChain`,
+without adding a custom RPC. Account/network events invalidate ephemeral state
+and rebuild the provider/signer as appropriate. No persistent financial cache is
+used. Refresh explicitly reads current Ethereum state.
+
+Discovery replaces pages of at most **20 group IDs**, starting with the latest.
+It is not a complete list of historical personal groups; direct ID lookup remains
+available. Creator join-request pages contain at most **20 applicants**, without
+capping total applicants. Member financial reads and the connected wallet's
+historical arrears scan are bounded by the contract's maximum **5 members/rounds**.
+
+All nine contract actions are wired: create group, request join, approve/reject,
+cancel OPEN group, contribute, settle, repay historical arrears, and withdraw the
+wallet's global payout. Eligibility is re-read before each write, with exact wei
+amounts, selected-account/network checks, and Sepolia block timestamps for deadline
+boundaries. These checks support the UI; the contract is final authority. No partial
+contribution/repayment inputs are offered. Completed/cancelled groups remain
+viewable; an unwithdrawn allocation remains withdrawable after completion.
+
+Final approval explicitly warns that it fills the group, activates immediately,
+starts Round 1, and freezes membership/payout order; confirmation is required
+before MetaMask opens. Cancellation and underfunded settlement also require
+confirmation. Contribution, repayment and withdrawal show exact amounts for review.
+
+A shared transaction runner presents Awaiting MetaMask → Submitted → Confirming →
+Confirmed, or Failed for a known rejection/revert. Duplicate writes are locked.
+Hashes link to Etherscan. Uncertain confirmations retain the hash, keep further
+writes locked, and offer a read-only confirmation check; transactions are never
+automatically resubmitted. After successful mining, the browser sends **only**
+`{"txHash":"..."}` to the backend. Indexing failure leaves the transaction
+Confirmed with a history-availability warning. Relevant live state refreshes after
+confirmation. New group IDs come from the authoritative `GroupCreated` receipt
+log, never from a potentially concurrent `groupCount()` read.
+
+History is clearly labelled **Indexed history** and may be incomplete. A MongoDB
+outage does not fail the group's live financial view. Cards display available
+member/recipient/amount, group/round, block/time and transaction link information.
+The existing backend's exclusive `beforeBlock` pagination is retained, including
+its inability to page within one block. No smoke history is backfilled.
+
+The CSS targets 360px mobile widths upward with wrapping text/addresses/amounts,
+stacked forms/cards, flexible navigation and touch-sized buttons. Labels, semantic
+controls, visible focus, readable contrast, text status badges and live status
+regions support keyboard/screen-reader use. All untrusted on-chain/indexed text
+is rendered as text, never HTML.
+
+Run offline frontend checks after `npm ci`:
+
+```sh
+node --check static/js/helpers.js
+node --check static/js/app.js
+node --test tests/test_frontend.js
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Current offline results: **41/41 frontend tests**, **60/60 Python tests** (the 58
+backend tests plus two template/static checks), and **164/164 Solidity tests**.
+
+Frontend tests use Node's built-in test/assert modules, the existing Ethers package,
+and a small fake DOM/provider: no browser/MetaMask/CDN/network access is required.
+CI runs these checks alongside the frozen Hardhat regression and Python backend
+suite. Offline tests cover validation/eligibility, receipt parsing, transaction
+and indexing states, account/network changes, duplicate-write prevention, final
+activation confirmation, history outages and safe text rendering.
+
+No live write, wallet funding, contract redeployment, MetaMask automation, MongoDB
+production setup, or Render deployment is performed in Iteration 8. Actual wallet
+approval and visual desktop/mobile browser validation remain user checks; no
+browser is installed in this workspace. Iteration 9 is not started.
 
 ## Technology stack
 
@@ -301,7 +398,7 @@ python -m pip install -r requirements.txt
 python -m flask --app app run
 ```
 
-Open http://127.0.0.1:5000/ to view the baseline page. Startup and that page need
+Open http://127.0.0.1:5000/ to view the frontend. Startup and that page need
 no blockchain or MongoDB credentials; API reads/indexing use runtime configuration
 as described above. Gunicorn is included for later Render deployment;
 the Flask application is not deployed.
@@ -313,7 +410,7 @@ copy it to `.env` and supply local values. **Never commit secrets or private key
 
 - `contracts/`, `test/`, `scripts/`, `deployment/`: Solidity and deployment tooling
 - `templates/`, `static/css/`, `static/js/`, `static/abi/`: Flask frontend assets
-- `app.py`: application factory, baseline route, and JSON API
+- `app.py`: application factory, frontend root route, and JSON API
 - `blockchain.py`, `database.py`: read-only Ethereum and optional indexed history services
 
 Generated Hardhat artifacts, local dependencies, and virtual environments are
